@@ -45,4 +45,7 @@ pub struct EksArgs {
     /// Region of the cluster
     #[arg(short('r'), long)]
     pub region: Option<String>,
+    /// Cluster name
+    #[arg(short('c'), long)]
+    pub cluster: Option<String>,
 }

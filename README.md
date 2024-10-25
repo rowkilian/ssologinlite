@@ -9,47 +9,62 @@ This Rust program is designed to manage AWS SSO (Single Sign-On) profiles and re
 - Debug mode for detailed logging
 - Command-line interface using `clap`
 
-## Dependencies
+## Installation
 
-This program relies on the following main crates:
-- `anyhow` for error handling
-- `ssologinlite` (custom crate) for AWS profile management
-- `clap` for parsing command-line arguments
-- `log` for logging
-- `tokio` for asynchronous runtime
+To install the program, run the following command:
+
+-
+- git
+  ```
+  git clone
+  cd ssologinlite
+  cargo install --path .
+  ```
+
 
 ## Usage
 
 The program supports two main commands:
 
 1. Setup:
-   ```
-   cargo run -- setup
-   ```
-   This command sets up the AWS SSO profiles.
+    ```
+    ssologinlite setup
+    ```
+    This command sets up the AWS SSO profiles.
+    It will back up the existing ~/.aws/config file and create a new one with the same profile names.
+    your ~/.aws/config file should look like this:
+    ```
+    [default]
+    credential_process=/Users/kilian/.cargo/bin/ssologinlite token --profile default
+    output=json
+    ```
 
 2. Token:
-   ```
-   cargo run -- token <profile_name>
-   ```
-   This command retrieves the authentication token for the specified profile.
+    ```
+    ssologinlite token <profile_name>
+    ```
+    This command retrieves the authentication token for the specified profile.
+    Add the `--debug` flag to any command to enable debug logging:
+    ```
+    ssologinlite -- --debug token <profile_name>
+    ```
 
-Add the `--debug` flag to any command to enable debug logging:
-```
-cargo run -- --debug token <profile_name>
-```
+3. Integrate in starship:
+    Add the following configuration to the `~/.config/starship.toml` file:
+    ```
+    [custom.sso_expiration]
+    when = '''ssologinlite sso-expires-soon'''
+    command = '''ssologinlite sso-expiration'''
+    format = '[\[$output\]]($style) '
+    style = 'bold red'
 
-## Error Handling
-
-The program uses `anyhow` for error handling and defines a custom error type `MyErrors` for specific error cases.
-
-## Structure
-
-- `main()`: The entry point of the program. It parses CLI arguments and executes the appropriate command.
-- `Cli`: A struct defined using `clap` to parse command-line arguments.
-- `Commands`: An enum representing the available commands (Setup and Token).
-- `Profiles`: A custom type from the `ssologinlite` crate that manages AWS profiles.
-- `MyErrors`: A custom error enum for specific error cases.
+    [custom.current_environment]
+    when = ''' test -n "${CURRENT_ENVIRONMENT}" '''
+    command = '''echo ${CURRENT_ENVIRONMENT}'''
+    style = 'bold blue'
+    symbol = '🦄 '
+    ```
+  This command sets up the starship and show if the sso credentials are expired.
 
 ## Note
 

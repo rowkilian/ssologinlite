@@ -76,7 +76,14 @@ async fn main() -> Result<ExitCode> {
                     }
                 },
             };
-            let eks_token = EksToken::from_credenials(credentials, region)?;
+            let cluster = match args.cluster.clone() {
+                Some(cluster) => cluster,
+                None => {
+                    error!("Cluster not found");
+                    return Err(anyhow!("no cluster argument"));
+                }
+            };
+            let eks_token = EksToken::from_credentials(credentials, region, &cluster)?;
             println!("{}", eks_token);
         }
         Commands::SSOExpiration => {
@@ -109,7 +116,7 @@ async fn main() -> Result<ExitCode> {
                 }
             };
             let (expires_in, _) = credentials.expires()?;
-            match { expires_in.num_hours() <= 1 } {
+            match { expires_in.num_hours() < 1 } {
                 true => {
                     return Ok(ExitCode::from(0));
                 }

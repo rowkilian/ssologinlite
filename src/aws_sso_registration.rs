@@ -1,4 +1,7 @@
-use crate::{cache::get_cached_sso_registration, constants::PROGRAM_NAME};
+use crate::{
+    cache::{cache_sso_registration, get_cached_sso_registration},
+    constants::PROGRAM_NAME,
+};
 use anyhow::{anyhow, Result};
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
@@ -108,6 +111,7 @@ impl SsoRegistration {
             clientId: client_id,
             expiresAt: datetime.to_rfc3339(),
         };
+        cache_sso_registration(&res).await?;
         Ok(res)
     }
 }

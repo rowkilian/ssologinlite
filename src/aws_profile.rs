@@ -67,74 +67,6 @@ impl Profiles {
                 "aws_profile.Profiles.from_existing_config looping into {:?}",
                 profile_name
             );
-            let sso_start_url = match profile.get("sso_start_url") {
-                Some(sso_start_url) => sso_start_url.to_string(),
-                None => {
-                    error!(
-                        "aws_profiles.Profiles.from_existing_config sso_start_url not in profile"
-                    );
-                    return Err(anyhow!("sso_start_url not in profile"));
-                }
-            };
-            let sso_region = match profile.get("sso_region") {
-                Some(sso_region) => sso_region.to_string(),
-                None => {
-                    error!("aws_profiles.Profiles.from_existing_config sso_region not in profile");
-                    return Err(anyhow!("sso_region not in profile"));
-                }
-            };
-            let sso_account_id = match profile.get("sso_account_id") {
-                Some(sso_account_id) => sso_account_id.to_string(),
-                None => {
-                    error!(
-                        "aws_profiles.Profiles.from_existing_config sso_account_id not in profile"
-                    );
-                    return Err(anyhow!("sso_account_id not in profile"));
-                }
-            };
-            let sso_role_name = match profile.get("sso_role_name") {
-                Some(sso_role_name) => sso_role_name.to_string(),
-                None => {
-                    error!(
-                        "aws_profiles.Profiles.from_existing_config sso_role_name not in profile"
-                    );
-                    return Err(anyhow!("sso_role_name not in profile"));
-                }
-            };
-            let source_profile = match profile.get("source_profile") {
-                Some(source_profile) => source_profile.to_string(),
-                None => {
-                    error!(
-                        "aws_profiles.Profiles.from_existing_config source_profile not in profile"
-                    );
-                    return Err(anyhow!("source_profile not in profile"));
-                }
-            };
-            let role_arn = match profile.get("role_arn") {
-                Some(role_arn) => role_arn.to_string(),
-                None => {
-                    error!("aws_profiles.Profiles.from_existing_config role_arn not in profile");
-                    return Err(anyhow!("role_arn not in profile"));
-                }
-            };
-            let region = match profile.get("region") {
-                Some(region) => region.to_string(),
-                None => {
-                    error!("aws_profiles.Profiles.from_existing_config region not in profile");
-                    return Err(anyhow!("region not in profile"));
-                }
-            };
-
-            let duration_seconds: Option<u16> = match profile.get("duration_seconds") {
-                Some(duration_seconds) => match duration_seconds.to_string().parse() {
-                    Ok(duration_seconds) => Some(duration_seconds),
-                    Err(_) => {
-                        error!("aws_profiles.Profiles.from_existing_config duration_seconds not in profile");
-                        return Err(anyhow!("duration_seconds not in profile"));
-                    }
-                },
-                None => None,
-            };
 
             match profile_name {
                 Some(profile_name) => {
@@ -143,6 +75,58 @@ impl Profiles {
                         && profile.contains_key("sso_account_id")
                         && profile.contains_key("sso_role_name")
                     {
+                        let sso_start_url = match profile.get("sso_start_url") {
+                            Some(sso_start_url) => sso_start_url.to_string(),
+                            None => {
+                                error!(
+                                    "aws_profiles.Profiles.from_existing_config sso_start_url not in profile"
+                                );
+                                return Err(anyhow!("sso_start_url not in profile"));
+                            }
+                        };
+                        let sso_region = match profile.get("sso_region") {
+                            Some(sso_region) => sso_region.to_string(),
+                            None => {
+                                error!("aws_profiles.Profiles.from_existing_config sso_region not in profile");
+                                return Err(anyhow!("sso_region not in profile"));
+                            }
+                        };
+                        let sso_account_id = match profile.get("sso_account_id") {
+                            Some(sso_account_id) => sso_account_id.to_string(),
+                            None => {
+                                error!(
+                                    "aws_profiles.Profiles.from_existing_config sso_account_id not in profile"
+                                );
+                                return Err(anyhow!("sso_account_id not in profile"));
+                            }
+                        };
+                        let sso_role_name = match profile.get("sso_role_name") {
+                            Some(sso_role_name) => sso_role_name.to_string(),
+                            None => {
+                                error!(
+                                    "aws_profiles.Profiles.from_existing_config sso_role_name not in profile"
+                                );
+                                return Err(anyhow!("sso_role_name not in profile"));
+                            }
+                        };
+                        // let region = match profile.get("region") {
+                        //     Some(region) => region.to_string(),
+                        //     None => {
+                        //         error!("aws_profiles.Profiles.from_existing_config region not in profile");
+                        //         return Err(anyhow!("region not in profile"));
+                        //     }
+                        // };
+
+                        let duration_seconds: Option<u16> = match profile.get("duration_seconds") {
+                            Some(duration_seconds) => match duration_seconds.to_string().parse() {
+                                Ok(duration_seconds) => Some(duration_seconds),
+                                Err(_) => {
+                                    error!("aws_profiles.Profiles.from_existing_config duration_seconds not in profile");
+                                    return Err(anyhow!("duration_seconds not in profile"));
+                                }
+                            },
+                            None => None,
+                        };
                         debug!("Inserting {}", profile_name);
                         let key: String = profile_name.replace("profile ", "");
                         profiles.insert(
@@ -161,6 +145,29 @@ impl Profiles {
                         && profile.contains_key("role_arn")
                         && profile.contains_key("region")
                     {
+                        let source_profile = match profile.get("source_profile") {
+                            Some(source_profile) => source_profile.to_string(),
+                            None => {
+                                error!(
+                                    "aws_profiles.Profiles.from_existing_config source_profile not in profile"
+                                );
+                                return Err(anyhow!("source_profile not in profile"));
+                            }
+                        };
+                        let role_arn = match profile.get("role_arn") {
+                            Some(role_arn) => role_arn.to_string(),
+                            None => {
+                                error!("aws_profiles.Profiles.from_existing_config role_arn not in profile");
+                                return Err(anyhow!("role_arn not in profile"));
+                            }
+                        };
+                        let region = match profile.get("region") {
+                            Some(region) => region.to_string(),
+                            None => {
+                                error!("aws_profiles.Profiles.from_existing_config region not in profile");
+                                return Err(anyhow!("region not in profile"));
+                            }
+                        };
                         let key: String = profile_name.replace("profile ", "");
                         debug!("Inserting {}", profile_name);
                         profiles.insert(
@@ -281,6 +288,7 @@ impl Profiles {
             }
         };
 
+        debug!("aws_profiles.Profiles.setup_file writing config");
         let aws_config = get_aws_config()?;
         let mut conf = match Ini::load_from_file(aws_config.as_os_str()) {
             Ok(conf) => conf,
@@ -289,12 +297,20 @@ impl Profiles {
             }
         };
         for profile in existing_profiles.profiles.keys() {
-            let ini_profile = format!("profile {}", profile);
+            debug!(
+                "aws_profiles.Profiles.setup_file writing profile {}",
+                profile
+            );
+            let ini_profile = match profile == "default" {
+                true => "default".to_string(),
+                _ => format!("profile {}", profile),
+            };
+            // let ini_profile = format!("profile {}", profile);
             let common_args = ["--profile".to_string(), profile.clone()];
             let section = match conf.section(Some(&ini_profile)) {
                 Some(section) => section.clone(),
                 None => {
-                    return Err(anyhow!(MyErrors::ProfileFileNotFound));
+                    return Err(anyhow!("Section '{}' not found", ini_profile));
                 }
             };
             for (k, _) in section.iter() {
