@@ -172,7 +172,7 @@ fn hmac_sha_256_hex(key: &Vec<u8>, data: &String) -> String {
     return format!("{:x}", hasher.finalize().into_bytes());
 }
 
-fn get_query_parameters(options: &GetSignedUrlOptions) -> String {
+fn get_query_parameters(options: &GetSignedUrlOptions, for_canonical: bool) -> String {
     let mut url_params: HashMap<String, String> = HashMap::new();
     url_params.insert("Action".to_string(), AUTH_COMMAND.to_string());
     url_params.insert("Version".to_string(), AUTH_API_VERSION.to_string());
@@ -204,7 +204,7 @@ fn get_query_parameters(options: &GetSignedUrlOptions) -> String {
         "X-Amz-Security-Token".to_string(),
         options.security_token.to_string(),
     );
-    return build_url_search_params(url_params);
+    return build_url_search_params(url_params, for_canonical);
 }
 
 fn get_canonical_request(
@@ -213,11 +213,11 @@ fn get_canonical_request(
     cluster: &String,
 ) -> String {
     // let key = &("/".to_string() + &options.key);
-    let host = &("host:".to_string() + &options.service + "." + &options.endpoint);
+    let host =
+        &("host:".to_string() + &options.service + "." + &options.region + "." + &options.endpoint);
     let cluster_header = format!("{}:{}", K8S_AWS_ID_HEADER, cluster);
     let eks_payload = format!("host;{}", K8S_AWS_ID_HEADER);
     let canonical_request: Vec<&str> = vec![
-        "",
         &options.method,
         "/",
         query_parameters,
@@ -250,35 +250,15 @@ pub fn get_signature_key(options: &GetSignedUrlOptions) -> Vec<u8> {
         "aws4_request".to_string(),
     ];
 
-    // let bytes_vec: Vec<Vec<u8>> = parts
-    //     .into_iter()
-    //     .map(|s| s.into_bytes())
-    //     .collect::<Vec<Vec<u8>>>();
+    let bytes_vec: Vec<Vec<u8>> = parts
+        .into_iter()
+        .map(|s| s.into_bytes())
+        .collect::<Vec<Vec<u8>>>();
 
-    let k_date = hmac_sha_256(
-        &parts[0].as_bytes().to_vec(), &parts[1].as_bytes().to_vec()
-    );
-    let k_region = hmac_sha_256(&k_date, &parts[2].as_bytes().to_vec());
-    let k_service = hmac_sha_256(&k_region, self._service_name)
-    let k_signing = hmac_sha_256(&k_service, 'aws4_request')
-    let k_result = hmac_sha_256(k_signing, string_to_sign);
-
-    // let vec_key: Vec<u8> = bytes_vec
-    //     .into_iter()
-    //     .inspect(|a| {
-    //         debug!(
-    //             "before {}",
-    //             String::from_utf8(a.clone()).expect("Our bytes should be valid utf8")
-    //         )
-    //     })
-    //     .reduce(|a, b| hmac_sha_256(&a, &b))
-    //     .inspect(|a| {
-    //         debug!(
-    //             "after {}",
-    //             String::from_utf8(a.clone()).expect("Our bytes should be valid utf8")
-    //         )
-    //     })
-    //     .unwrap();
+    let vec_key: Vec<u8> = bytes_vec
+        .into_iter()
+        .reduce(|a, b| hmac_sha_256(&a, &b))
+        .unwrap();
     return vec_key;
 }
 
@@ -301,15 +281,15 @@ fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: S
 }
 
 pub fn get_signed_url(options: &GetSignedUrlOptions, cluster: &String) -> String {
-    let signature_key = get_signature_key(&options);
-
-    let query_parameters = get_query_parameters(&options);
-    let canonical_request = get_canonical_request(&options, &query_parameters, cluster);
+    let query_parameters_cr = get_query_parameters(&options, true);
+    let query_parameters = get_query_parameters(&options, false);
+    let canonical_request = get_canonical_request(&options, &query_parameters_cr, cluster);
     debug!("canonical_request = {}", canonical_request);
     let signature_payload = get_signature_payload(&options, canonical_request);
-    debug!("signature_key = {:?}", signature_key);
     debug!("signature_payload = {}", signature_payload);
+    let signature_key = get_signature_key(&options);
     let signature = hmac_sha_256_hex(&signature_key, &signature_payload);
+    debug!("signature = {}", signature);
     let url = get_url(&options, query_parameters, signature);
     return url;
 }
@@ -318,7 +298,7 @@ fn base64_encode(data: &String) -> String {
     return STANDARD.encode(data);
 }
 
-fn build_url_search_params(params: HashMap<String, String>) -> String {
+fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool) -> String {
     let mut key_value_list: Vec<String> = vec![];
     for (key, value) in params {
         let param = [
@@ -331,8 +311,10 @@ fn build_url_search_params(params: HashMap<String, String>) -> String {
     }
 
     key_value_list.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    (key_value_list[6], key_value_list[7]) = (key_value_list[7].clone(), key_value_list[6].clone());
-
+    if !for_canonical {
+        (key_value_list[6], key_value_list[7]) =
+            (key_value_list[7].clone(), key_value_list[6].clone());
+    };
     let url_search_params: String = key_value_list.join("&");
 
     url_search_params
