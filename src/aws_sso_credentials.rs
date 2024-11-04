@@ -61,7 +61,7 @@ impl SsoCredentials {
             Some(creds) => Ok(creds),
             None => {
                 error!("No credentials found in cache for url.");
-                return Err(anyhow!(MyErrors::CredentialsFromURLError));
+                Err(anyhow!(MyErrors::CredentialsFromURLError))
             }
         }
     }

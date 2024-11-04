@@ -13,7 +13,13 @@ This Rust program is designed to manage AWS SSO (Single Sign-On) profiles and re
 
 To install the program, run the following command:
 
--
+- Download the binary from the release page
+  ```
+  curl -LO https://github.com/rowkilian/ssologinlite/releases/download/v0.3.5/ssologinlite.zip
+  unzip ssologinlite.zip
+  mv ssologinlite /usr/local/bin
+  ```
+
 - git
   ```
   git clone
@@ -57,12 +63,6 @@ The program supports two main commands:
     command = '''ssologinlite sso-expiration'''
     format = '[\[$output\]]($style) '
     style = 'bold red'
-
-    [custom.current_environment]
-    when = ''' test -n "${CURRENT_ENVIRONMENT}" '''
-    command = '''echo ${CURRENT_ENVIRONMENT}'''
-    style = 'bold blue'
-    symbol = '🦄 '
     ```
   This command sets up the starship and show if the sso credentials are expired.
 

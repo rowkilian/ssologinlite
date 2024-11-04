@@ -96,7 +96,7 @@ async fn main() -> Result<ExitCode> {
             };
 
             let (expires_in, _) = credentials.expires()?;
-            let sso_expiration = match { expires_in.num_seconds() <= 0 } {
+            let sso_expiration = match expires_in.num_seconds() <= 0 {
                 true => "SSO Expired".to_string(),
                 false => format!(
                     "SSO Expires in {:02}:{:02}:{:02}",
@@ -116,7 +116,7 @@ async fn main() -> Result<ExitCode> {
                 }
             };
             let (expires_in, _) = credentials.expires()?;
-            match { expires_in.num_hours() < 1 } {
+            match expires_in.num_hours() < 1 {
                 true => {
                     return Ok(ExitCode::from(0));
                 }

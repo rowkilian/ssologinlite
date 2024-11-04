@@ -2,6 +2,9 @@
 name = "ssologinlite"
 version = "0.3.5"
 edition = "2021"
+authors = ["Kilian Rault"]
+homepage = "https://github.com/rowkilian/ssologinlite"
+rust-version = "1.77.2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
@@ -44,3 +47,7 @@ lto = true
 codegen-units = 1
 panic = 'abort'
 opt-level = 'z'
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-gcc-ar"

@@ -225,7 +225,7 @@ impl Profiles {
                 return Err(anyhow!("Error serializing profile"));
             }
         };
-        match file.write(data.as_bytes()) {
+        match file.write_all(data.as_bytes()) {
             Ok(_) => {}
             Err(e) => {
                 error!("aws_profiles.Profiles.to_file {:?}", e);
@@ -272,7 +272,7 @@ impl Profiles {
                 return Err(anyhow!("Error serializing profile file"));
             }
         };
-        match file.write(data.as_bytes()) {
+        match file.write_all(data.as_bytes()) {
             Ok(_) => {}
             Err(e) => {
                 error!("aws_profiles.Profiles.setup_file {:?}", e);

@@ -3,66 +3,199 @@ name: Rust
 on: [push]
 
 env:
+  CICD_INTERMEDIATES_DIR: "_cicd-intermediates"
+  MSRV_FEATURES: "--all-features"
   CARGO_TERM_COLOR: always
 
-
 jobs:
-  build:
-    if: ${{ ! github.ref_type == 'tag'}}
-    runs-on: ubuntu-latest
-
+  crate_metadata:
+    name: Extract crate metadata
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --release
-    - name: Archive
-      run: zip ./ssologinlite.zip target/release/ssologinlite
+    - name: Extract crate information
+      id: crate_metadata
+      run: |
+        echo "name=ssologinlite" | tee -a $GITHUB_OUTPUT
+        cargo metadata --no-deps --format-version 1 | jq -r '"version=" + .packages[0].version' | tee -a $GITHUB_OUTPUT
+        cargo metadata --no-deps --format-version 1 | jq -r '"maintainer=" + .packages[0].authors[0]' | tee -a $GITHUB_OUTPUT
+        cargo metadata --no-deps --format-version 1 | jq -r '"homepage=" + .packages[0].homepage' | tee -a $GITHUB_OUTPUT
+        cargo metadata --no-deps --format-version 1 | jq -r '"msrv=" + .packages[0].rust_version' | tee -a $GITHUB_OUTPUT
+    outputs:
+      name: ${{ steps.crate_metadata.outputs.name }}
+      version: ${{ steps.crate_metadata.outputs.version }}
+      maintainer: ${{ steps.crate_metadata.outputs.maintainer }}
+      homepage: ${{ steps.crate_metadata.outputs.homepage }}
+      msrv: ${{ steps.crate_metadata.outputs.msrv }}
+
+  ensure_cargo_fmt:
+    name: Ensure 'cargo fmt' has been run
+    runs-on: ubuntu-20.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - uses: actions/checkout@v4
+    - run: cargo fmt -- --check
+
+  # lint_check:
+  #   name: Ensure 'cargo clippy' has no warnings
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #   - uses: dtolnay/rust-toolchain@stable
+  #     with:
+  #       components: clippy
+  #   - uses: actions/checkout@v4
+  #   - run: cargo clippy --all-targets --all-features -- -Dwarnings
+
+  min_version:
+    name: Minimum supported rust version
+    runs-on: ubuntu-20.04
+    needs: crate_metadata
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install rust toolchain (v${{ needs.crate_metadata.outputs.msrv }})
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ needs.crate_metadata.outputs.msrv }}
+        components: clippy
+    - name: Run clippy (on minimum supported rust version to prevent warnings we can't fix)
+      run: cargo clippy --locked --all-targets ${{ env.MSRV_FEATURES }}
+    - name: Run tests
+      run: cargo test --locked ${{ env.MSRV_FEATURES }}
+
 
   release:
+    needs: crate_metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { target: aarch64-unknown-linux-gnu   , os: ubuntu-22.04, use-cross: true  , use-target: true}
+          - { target: arm-unknown-linux-gnueabihf , os: ubuntu-22.04, use-cross: true  , use-target: true}
+          - { target: i686-unknown-linux-gnu      , os: ubuntu-22.04, use-cross: true  , use-target: true}
+          - { target: x86_64-apple-darwin         , os: macos-12,     use-cross: false , use-target: false}
+          - { target: aarch64-apple-darwin        , os: macos-14,     use-cross: false , use-target: false}
+          - { target: x86_64-pc-windows-gnu       , os: windows-2022, use-cross: false , use-target: true}
+          - { target: x86_64-pc-windows-msvc      , os: windows-2022, use-cross: false , use-target: true}
+          - { target: x86_64-unknown-linux-gnu    , os: ubuntu-22.04, use-cross: true  , use-target: true}
+    env:
+      BUILD_CMD: cargo
+      TARGET_OPTS : ""
+      TARGET_DIR: "target/release/"
+
     name: Releasing
     if: ${{ github.ref_type == 'tag' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.job.target }}
+        toolchain: "${{ contains(matrix.job.target, 'windows-') && '1.77.2' || 'stable' }}"
+
+    - name: Install cross
+      if: matrix.job.use-cross
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cross
+
+    - name: Overwrite build command env variable
+      if: matrix.job.use-cross
+      shell: bash
+      run: echo "BUILD_CMD=cross" >> $GITHUB_ENV
+
+    - name: Set Target
+      if: matrix.job.use-target
+      shell: bash
+      run: |
+        echo "TARGET_OPTS=--target=${{ matrix.job.target }}" >> $GITHUB_ENV
+        echo "TARGET_DIR=target/${{ matrix.job.target }}/release" >> $GITHUB_ENV
+
+    - name: Show version information (Rust, cargo, GCC)
+      shell: bash
+      run: |
+        gcc --version || true
+        rustup -V
+        rustup toolchain list
+        rustup default
+        cargo -V
+        rustc -V
+
     - name: Build
-      run: cargo build --release
-    - name: Archive
-      run: zip ./ssologinlite.zip target/release/ssologinlite
+      shell: bash
+      run: |
+        case ${{ matrix.job.target }} in
+          *-pc-windows-gnu)
+          sudo apt install mingw-w64;;
+        esac;
+        $BUILD_CMD build --locked --release $TARGET_OPTS
 
-  release:
-    name: Releasing
-    if: github.event_name == 'release' && github.event.action == 'created'
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --release
-    - name: Archive
-      run: zip ./ssologinlite.zip target/release/ssologinlite
+    # - name: Action tests
+    #   shell: bash
+    #   run: |
+    #     # Figure out suffix of binary
+    #     EXE_suffix=""
+    #     case ${{ matrix.job.target }} in
+    #       *-pc-windows-*) EXE_suffix=".exe" ;;
+    #     esac;
 
-    - name: Create Draft Release
-      id: create_release
-      uses: actions/create-release@v1
+    #     # Setup paths
+    #     BIN_NAME="${{ needs.crate_metadata.outputs.name }}${EXE_suffix}"
+    #     BIN_PATH="${TARGET_DIR}/${BIN_NAME}"
+    #     ZIP_NAME="${BIN_NAME}-${{ matrix.job.target }}.zip"
+    #     PKG_STAGING="${{ env.CICD_INTERMEDIATES_DIR }}/package"
+    #     PKG_NAME="${PKG_STAGING}/${ZIP_NAME}"
+    #     mkdir -p "${PKG_STAGING}"
+
+    #     find -name "ssologinlite*" -type f
+
+    - name: Set binary, compressed binary name & path
+      id: package
+      shell: bash
+      run: |
+        # Figure out suffix of binary
+        EXE_suffix=""
+        case ${{ matrix.job.target }} in
+          *-pc-windows-*) EXE_suffix=".exe"
+          sudo apt install mingw-w64;;
+        esac;
+
+        # Setup paths
+        BIN_NAME="${{ needs.crate_metadata.outputs.name }}${EXE_suffix}"
+        BIN_PATH="${TARGET_DIR}/${BIN_NAME}"
+        ZIP_NAME="${BIN_NAME}-${{ matrix.job.target }}.zip"
+        PKG_STAGING="${{ env.CICD_INTERMEDIATES_DIR }}/package"
+        PKG_NAME="${PKG_STAGING}/${ZIP_NAME}"
+        mkdir -p "${PKG_STAGING}"
+
+        find -name "${BIN_NAME}" -type f
+        find -name "${BIN_NAME}" -type f -exec ls -l {} \;
+
+        cp ${BIN_PATH} ${PKG_STAGING}
+
+        # Zip binary
+        pushd "${PKG_STAGING}"
+        zip ${ZIP_NAME} ${BIN_NAME}
+        rm ${BIN_NAME}
+
+        popd > /dev/null
+
+        # Let subsequent steps know where to find the binary
+        echo "BIN_PATH=${BIN_PATH}" >> $GITHUB_OUTPUT
+        echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_OUTPUT
+        echo "PKG_NAME=${PKG_NAME}" >> $GITHUB_OUTPUT
+        echo "${PKG_NAME}"
+        ls -l "${PKG_NAME}"
+        stat "${PKG_NAME}"
+
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.package.outputs.PKG_NAME }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref_name }}
-        release_name: Release ${{ github.ref_name }}
-        draft: true
-        prerelease: false
-
-    - uses: actions/upload-release-asset@v1.0.1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./ssologinlite.zip
-        asset_name: ssologinlite.zip
-        asset_content_type: application/zip
-
-    - uses: eregon/publish-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        release_id: ${{ steps.create_release.outputs.id }}

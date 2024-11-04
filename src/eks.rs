@@ -157,19 +157,19 @@ impl GetSignedUrlOptions {
 fn sha256(data: &String) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    return format!("{:x}", hasher.finalize());
+    format!("{:x}", hasher.finalize())
 }
 
 fn hmac_sha_256(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     hasher.update(data);
-    return hasher.finalize().into_bytes().to_vec();
+    hasher.finalize().into_bytes().to_vec()
 }
 
 fn hmac_sha_256_hex(key: &Vec<u8>, data: &String) -> String {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     hasher.update(data.as_bytes());
-    return format!("{:x}", hasher.finalize().into_bytes());
+    format!("{:x}", hasher.finalize().into_bytes())
 }
 
 fn get_query_parameters(options: &GetSignedUrlOptions, for_canonical: bool) -> String {
@@ -204,7 +204,7 @@ fn get_query_parameters(options: &GetSignedUrlOptions, for_canonical: bool) -> S
         "X-Amz-Security-Token".to_string(),
         options.security_token.to_string(),
     );
-    return build_url_search_params(url_params, for_canonical);
+    build_url_search_params(url_params, for_canonical)
 }
 
 fn get_canonical_request(
@@ -227,7 +227,7 @@ fn get_canonical_request(
         eks_payload.as_str(),
         EMPTY_SHA256_HASH,
     ];
-    return canonical_request.join("\n");
+    canonical_request.join("\n")
 }
 
 fn get_signature_payload(options: &GetSignedUrlOptions, payload: String) -> String {
@@ -238,7 +238,7 @@ fn get_signature_payload(options: &GetSignedUrlOptions, payload: String) -> Stri
         &(date2.to_owned() + "/" + &options.region + "/" + &options.service + "/aws4_request");
 
     let signature_payload: Vec<&str> = vec!["AWS4-HMAC-SHA256", &date1, &third, payload_hash];
-    return signature_payload.join("\n");
+    signature_payload.join("\n")
 }
 
 pub fn get_signature_key(options: &GetSignedUrlOptions) -> Vec<u8> {
@@ -259,7 +259,7 @@ pub fn get_signature_key(options: &GetSignedUrlOptions) -> Vec<u8> {
         .into_iter()
         .reduce(|a, b| hmac_sha_256(&a, &b))
         .unwrap();
-    return vec_key;
+    vec_key
 }
 
 fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: String) -> String {
@@ -277,25 +277,25 @@ fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: S
         "&X-Amz-Signature=",
         &signature,
     ];
-    return url.join("");
+    url.join("")
 }
 
 pub fn get_signed_url(options: &GetSignedUrlOptions, cluster: &String) -> String {
-    let query_parameters_cr = get_query_parameters(&options, true);
-    let query_parameters = get_query_parameters(&options, false);
-    let canonical_request = get_canonical_request(&options, &query_parameters_cr, cluster);
+    let query_parameters_cr = get_query_parameters(options, true);
+    let query_parameters = get_query_parameters(options, false);
+    let canonical_request = get_canonical_request(options, &query_parameters_cr, cluster);
     debug!("canonical_request = {}", canonical_request);
-    let signature_payload = get_signature_payload(&options, canonical_request);
+    let signature_payload = get_signature_payload(options, canonical_request);
     debug!("signature_payload = {}", signature_payload);
-    let signature_key = get_signature_key(&options);
+    let signature_key = get_signature_key(options);
     let signature = hmac_sha_256_hex(&signature_key, &signature_payload);
     debug!("signature = {}", signature);
-    let url = get_url(&options, query_parameters, signature);
-    return url;
+
+    get_url(options, query_parameters, signature)
 }
 
 fn base64_encode(data: &String) -> String {
-    return STANDARD.encode(data);
+    STANDARD.encode(data)
 }
 
 fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool) -> String {
@@ -310,7 +310,7 @@ fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool)
         key_value_list.push(param);
     }
 
-    key_value_list.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    key_value_list.sort_by_key(|a| a.to_lowercase());
     if !for_canonical {
         (key_value_list[6], key_value_list[7]) =
             (key_value_list[7].clone(), key_value_list[6].clone());
