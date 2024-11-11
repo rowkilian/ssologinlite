@@ -1,13 +1,27 @@
 # AWS Token Manager
 
-This Rust program is designed to manage AWS SSO (Single Sign-On) profiles and retrieve authentication tokens. It provides functionality for setting up profiles and obtaining tokens for both SSO and Assume SSO profiles.
+This program is designed to manage AWS SSO (Single Sign-On) profiles and retrieve authentication tokens. It provides functionality for setting up profiles and obtaining tokens for both SSO and Assume SSO profiles.
+It uses the `credential_process` field in the `~/.aws/config` file to retrieve the authentication token for the specified profile.
+
+## Why?
+
+Saves you to type `aws sso login ...` every time you need to login to AWS SSO.
+On MacOS, you can set it up not to use the default browser.
+Logs actions in the ~/.aws/ssologinlite/logs directory.
+
+## Config
+
+config example:
+```cat << EOF > ~/.config/ssologinlite.toml
+browser = "firefox"
+default_sso_url = "https://myawsorg.awsapps.com/start/"
+EOF
+```
 
 ## Features
 
 - Setup AWS SSO profiles
 - Retrieve authentication tokens for SSO and Assume SSO profiles
-- Debug mode for detailed logging
-- Command-line interface using `clap`
 
 ## Installation
 
