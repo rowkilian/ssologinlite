@@ -5,6 +5,7 @@ use clap::Parser;
 use log::{debug, error};
 use ssologinlite::aws_profile::{Profile::AssumeSsoProfile, Profile::SsoProfile, Profiles};
 use ssologinlite::aws_sso_credentials::SsoCredentials;
+use ssologinlite::cache::clear_cache;
 use ssologinlite::config::ProgramConfig;
 use ssologinlite::eks::EksToken;
 use ssologinlite::logger::logger;
@@ -124,6 +125,10 @@ async fn main() -> Result<ExitCode> {
                     return Ok(ExitCode::from(1));
                 }
             };
+        }
+        Commands::Flush => {
+            let _ = clear_cache().await?;
+            return Ok(ExitCode::from(0));
         }
     }
 

@@ -29,7 +29,7 @@ To install the program, run the following command:
 
 - Download the binary from the release page
   ```
-  curl -LO https://github.com/rowkilian/ssologinlite/releases/download/v0.3.5/ssologinlite.zip
+  curl -LO https://github.com/rowkilian/ssologinlite/releases/download/latest/ssologinlite.zip
   unzip ssologinlite.zip
   mv ssologinlite /usr/local/bin
   ```

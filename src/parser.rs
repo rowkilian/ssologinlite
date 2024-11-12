@@ -28,6 +28,8 @@ pub enum Commands {
     SSOExpiration,
     /// Exit code 0 if sso login is required.
     SSOExpiresSoon,
+    /// Flushes out the cached tokens.
+    Flush,
 }
 
 #[derive(Args)]

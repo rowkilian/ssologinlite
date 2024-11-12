@@ -8,6 +8,7 @@ use log::{debug, error, info};
 use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
 use serde::Serialize;
 use serde_json;
+use std::fs::remove_file;
 
 // Get cache
 pub async fn get_cached_credentials(profile: &str) -> Option<AWScredentials> {
@@ -101,6 +102,20 @@ pub async fn get_cache(key: &str) -> Option<String> {
 
     let _ = restrict_file_permissions(&str_cache_file);
     db.get::<String>(key)
+}
+
+// Remove all cache entries
+pub async fn clear_cache() -> Result<()> {
+    let str_cache_file =
+        match get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, CREDS_CACHE).as_str()) {
+            Ok(rel_cache_file) => rel_cache_file,
+            Err(e) => {
+                error!("{}", e);
+                return Err(anyhow!(MyErrors::Cache));
+            }
+        };
+    let _ = remove_file(str_cache_file)?;
+    Ok(())
 }
 
 // Generic store cache
