@@ -1,6 +1,6 @@
 [package]
 name = "ssologinlite"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 authors = ["Kilian Rault"]
 homepage = "https://github.com/rowkilian/ssologinlite"
@@ -39,6 +39,9 @@ hmac = "0.12.1"
 sha2 = "0.10.8"
 url-search-params = "12.0.0"
 base64 = "0.22.1"
+
+[dev-dependencies]
+proptest = "1.4"
 
 [profile.release]
 strip = 'symbols'

@@ -22,7 +22,7 @@ pub enum Commands {
     Setup,
     /// Get a auth token for a profile
     Token(TokenArgs),
-    /// Gets EKS auth token(not working yet).
+    /// Gets EKS auth token.
     Eks(EksArgs),
     /// Time left before the next sso login.
     SSOExpiration,

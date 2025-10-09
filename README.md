@@ -1,85 +1,167 @@
-# AWS Token Manager
+# ssologinlite
 
-This program is designed to manage AWS SSO (Single Sign-On) profiles and retrieve authentication tokens. It provides functionality for setting up profiles and obtaining tokens for both SSO and Assume SSO profiles.
-It uses the `credential_process` field in the `~/.aws/config` file to retrieve the authentication token for the specified profile.
+A lightweight AWS SSO (Single Sign-On) authentication manager that automates credential management for AWS CLI and kubectl.
 
 ## Why?
 
-Saves you to type `aws sso login ...` every time you need to login to AWS SSO.
-On MacOS, you can set it up not to use the default browser.
-Logs actions in the ~/.aws/ssologinlite/logs directory.
+- **No manual logins**: Eliminates the need to run `aws sso login` repeatedly
+- **Custom browser support**: On macOS, use your preferred browser instead of the default
+- **EKS integration**: Generate authentication tokens for Amazon EKS clusters
+- **Automatic refresh**: Credentials are cached and refreshed automatically
+- **Audit logging**: All actions are logged to `~/.aws/ssologinlite/logs/`
 
-## Config
+## Configuration
 
-config example:
-```cat << EOF > ~/.config/ssologinlite.toml
+Create a configuration file at `~/.config/ssologinlite.toml`:
+
+```toml
 browser = "firefox"
 default_sso_url = "https://myawsorg.awsapps.com/start/"
-EOF
 ```
+
+**Options:**
+- `browser`: Browser to use for SSO login (e.g., "firefox", "chrome", "safari")
+- `default_sso_url`: Your organization's AWS SSO start URL
 
 ## Features
 
-- Setup AWS SSO profiles
-- Retrieve authentication tokens for SSO and Assume SSO profiles
+- **AWS SSO Profile Management**: Automatically configure and manage SSO profiles
+- **Assume Role Support**: Seamlessly handle role assumption across accounts
+- **EKS Authentication**: Generate kubectl-compatible authentication tokens
+- **Credential Caching**: Reduce authentication overhead with intelligent caching
+- **Shell Integration**: Starship prompt integration for credential expiration warnings
 
 ## Installation
 
-To install the program, run the following command:
+### Option 1: Download Pre-built Binary
 
-- Download the binary from the release page
-  ```
-  curl -LO https://github.com/rowkilian/ssologinlite/releases/download/v0.3.5/ssologinlite.zip
-  unzip ssologinlite.zip
-  mv ssologinlite /usr/local/bin
-  ```
+```bash
+curl -LO https://github.com/rowkilian/ssologinlite/releases/download/v0.3.5/ssologinlite.zip
+unzip ssologinlite.zip
+mv ssologinlite /usr/local/bin
+chmod +x /usr/local/bin/ssologinlite
+```
 
-- git
-  ```
-  git clone
-  cd ssologinlite
-  cargo install --path .
-  ```
+### Option 2: Build from Source
+
+```bash
+git clone https://github.com/rowkilian/ssologinlite.git
+cd ssologinlite
+cargo install --path .
+```
 
 
 ## Usage
 
-The program supports two main commands:
+### Setup AWS Profiles
 
-1. Setup:
-    ```
-    ssologinlite setup
-    ```
-    This command sets up the AWS SSO profiles.
-    It will back up the existing ~/.aws/config file and create a new one with the same profile names.
-    your ~/.aws/config file should look like this:
-    ```
-    [default]
-    credential_process=/Users/kilian/.cargo/bin/ssologinlite token --profile default
-    output=json
-    ```
+Configure your AWS SSO profiles to use ssologinlite:
 
-2. Token:
-    ```
-    ssologinlite token <profile_name>
-    ```
-    This command retrieves the authentication token for the specified profile.
-    Add the `--debug` flag to any command to enable debug logging:
-    ```
-    ssologinlite -- --debug token <profile_name>
-    ```
+```bash
+ssologinlite setup
+```
 
-3. Integrate in starship:
-    Add the following configuration to the `~/.config/starship.toml` file:
-    ```
-    [custom.sso_expiration]
-    when = '''ssologinlite sso-expires-soon'''
-    command = '''ssologinlite sso-expiration'''
-    format = '[\[$output\]]($style) '
-    style = 'bold red'
-    ```
-  This command sets up the starship and show if the sso credentials are expired.
+This command:
+- Backs up your existing `~/.aws/config` file
+- Configures profiles to use ssologinlite as the credential process
 
-## Note
+Your `~/.aws/config` will be updated to look like:
 
-This program is designed to work with AWS SSO and assumes the existence of a custom `ssologinlite` crate for AWS-related functionality. Ensure you have the necessary AWS credentials and permissions set up before using this program.
+```ini
+[default]
+credential_process = /path/to/ssologinlite token --profile default
+output = json
+```
+
+### Get AWS Credentials
+
+Retrieve authentication tokens for a specific profile:
+
+```bash
+ssologinlite token <profile_name>
+```
+
+The credentials are cached and automatically refreshed when needed.
+
+### EKS Authentication
+
+Generate authentication tokens for Amazon EKS clusters:
+
+```bash
+ssologinlite eks --profile <profile_name> --cluster <cluster_name> --region <aws_region>
+```
+
+**Example:**
+```bash
+ssologinlite eks --profile production --cluster my-eks-cluster --region us-west-2
+```
+
+This generates a kubectl-compatible authentication token. Configure kubectl to use it:
+
+```yaml
+# ~/.kube/config
+users:
+- name: my-eks-cluster
+  user:
+    exec:
+      apiVersion: client.authentication.k8s.io/v1beta1
+      command: ssologinlite
+      args:
+        - eks
+        - --profile
+        - production
+        - --cluster
+        - my-eks-cluster
+        - --region
+        - us-west-2
+```
+
+### Debug Mode
+
+Enable detailed logging for troubleshooting:
+
+```bash
+ssologinlite --debug token <profile_name>
+```
+
+## Shell Integration
+
+### Starship Prompt
+
+Show SSO credential expiration status in your shell prompt by adding to `~/.config/starship.toml`:
+
+```toml
+[custom.sso_expiration]
+when = '''ssologinlite sso-expires-soon'''
+command = '''ssologinlite sso-expiration'''
+format = '[\[$output\]]($style) '
+style = 'bold red'
+```
+
+This displays a warning when your SSO credentials are about to expire.
+
+## Requirements
+
+- AWS SSO must be configured in your organization
+- Valid AWS SSO permissions for the profiles you want to use
+- For EKS: Appropriate IAM permissions to access EKS clusters
+
+## How It Works
+
+`ssologinlite` integrates with AWS CLI's `credential_process` mechanism:
+
+1. When you run an AWS CLI command, it calls `ssologinlite token`
+2. ssologinlite checks for cached, valid credentials
+3. If needed, it initiates SSO login via your browser
+4. Fresh credentials are cached for future use
+5. The credentials are returned to AWS CLI in the expected JSON format
+
+For EKS, it generates pre-signed STS URLs following the AWS authentication protocol, compatible with kubectl's exec credential plugin system.
+
+## License
+
+See the [LICENSE](LICENSE) file for details.
+
+## Contributing
+
+Contributions are welcome! Please open an issue or submit a pull request.

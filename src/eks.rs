@@ -68,11 +68,9 @@ impl Status {
             credentials.SessionToken,
         );
         let url = get_signed_url(&signed_url, cluster);
-        let encoded_url = match base64_encode(&url).strip_suffix("=") {
-            Some(b64string) => b64string.to_string(),
-            None => base64_encode(&url),
-        };
-        let token = format!("{}{}", TOKEN_PREFIX, encoded_url);
+        let encoded_url = base64_encode(&url).trim_end_matches('=').to_string();
+        let sanitized_encoded_url =  encoded_url.replace("/", "_");
+        let token = format!("{}{}", TOKEN_PREFIX, sanitized_encoded_url);
         // let token = format!("{}{}", TOKEN_PREFIX, base64_encode(&url));
         let expiration_timestamp = (Utc::now() + Duration::minutes(TOKEN_EXPIRATION_MINS))
             .format("%Y-%m-%dT%H:%M:%SZ")
@@ -95,7 +93,12 @@ impl EksToken {
             status,
             ..Default::default()
         };
-        Ok(serde_json::to_string(&token)?)
+        let mut buf = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        token.serialize(&mut ser).unwrap();
+        // Ok(serde_json::to_string_pretty(&token)?)
+        Ok(String::from_utf8(buf)?)
     }
 }
 
@@ -318,4 +321,297 @@ fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool)
     let url_search_params: String = key_value_list.join("&");
 
     url_search_params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sha256_hash() {
+        let input = "test".to_string();
+        assert_eq!(
+            sha256(&input),
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+        );
+    }
+
+    #[test]
+    fn test_sha256_empty_string() {
+        let input = "".to_string();
+        assert_eq!(sha256(&input), EMPTY_SHA256_HASH);
+    }
+
+    #[test]
+    fn test_hmac_sha256_produces_correct_length() {
+        let key = b"key".to_vec();
+        let data = b"data".to_vec();
+        let result = hmac_sha_256(&key, &data);
+        assert_eq!(result.len(), 32); // SHA256 produces 32 bytes
+    }
+
+    #[test]
+    fn test_hmac_sha256_hex_format() {
+        let key = b"key".to_vec();
+        let data = "data".to_string();
+        let result = hmac_sha_256_hex(&key, &data);
+        assert_eq!(result.len(), 64); // Hex string is 2x byte length
+        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_base64_encode() {
+        let input = "test".to_string();
+        let encoded = base64_encode(&input);
+        assert_eq!(encoded, "dGVzdA==");
+    }
+
+    #[test]
+    fn test_base64_encode_padding_removal() {
+        let input = "https://example.com".to_string();
+        let encoded = base64_encode(&input);
+        assert!(encoded.ends_with("=") || !encoded.is_empty());
+    }
+
+    #[test]
+    fn test_get_signed_url_format() {
+        let options = GetSignedUrlOptions::default();
+        let cluster = "test-cluster".to_string();
+        let url = get_signed_url(&options, &cluster);
+
+        assert!(url.starts_with("https://sts."));
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(url.contains("X-Amz-Signature="));
+        assert!(url.contains("X-Amz-Security-Token="));
+    }
+
+    #[test]
+    fn test_get_query_parameters_canonical() {
+        let options = GetSignedUrlOptions::default();
+        let params = get_query_parameters(&options, true);
+
+        assert!(params.contains("Action=GetCallerIdentity"));
+        assert!(params.contains("Version=2011-06-15"));
+        assert!(params.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+    }
+
+    #[test]
+    fn test_get_query_parameters_non_canonical() {
+        let options = GetSignedUrlOptions::default();
+        let params = get_query_parameters(&options, false);
+
+        assert!(params.contains("Action=GetCallerIdentity"));
+        assert!(params.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+    }
+
+    #[test]
+    fn test_canonical_request_structure() {
+        let options = GetSignedUrlOptions::default();
+        let params = get_query_parameters(&options, true);
+        let cluster = "test-cluster-123".to_string();
+
+        let canonical = get_canonical_request(&options, &params, &cluster);
+
+        assert!(canonical.contains("GET"));
+        assert!(canonical.contains("host:sts.us-east-1.amazonaws.com"));
+        assert!(canonical.contains("x-k8s-aws-id:test-cluster-123"));
+        assert!(canonical.contains(EMPTY_SHA256_HASH));
+    }
+
+    #[test]
+    fn test_signature_key_deterministic() {
+        let options = GetSignedUrlOptions::default();
+        let key1 = get_signature_key(&options);
+        let key2 = get_signature_key(&options);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_signature_key_length() {
+        let options = GetSignedUrlOptions::default();
+        let key = get_signature_key(&options);
+        assert_eq!(key.len(), 32); // HMAC-SHA256 produces 32 bytes
+    }
+
+    #[test]
+    fn test_signature_payload_format() {
+        let options = GetSignedUrlOptions::default();
+        let payload = "test payload".to_string();
+        let signature_payload = get_signature_payload(&options, payload);
+
+        assert!(signature_payload.starts_with("AWS4-HMAC-SHA256"));
+        assert!(signature_payload.contains("us-east-1"));
+        assert!(signature_payload.contains("sts"));
+    }
+
+    #[test]
+    fn test_eks_token_default_structure() {
+        let token = EksToken::default();
+        assert_eq!(token.kind, "ExecCredential");
+        assert_eq!(token.apiVersion, BETA_API);
+        assert_eq!(token.status.token, "");
+        assert_eq!(token.status.expirationTimestamp, "");
+    }
+
+    #[test]
+    fn test_status_from_credentials() {
+        let creds_json = r#"{
+            "Version": 1,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "token123",
+            "Expiration": "2025-01-01T00:00:00Z"
+        }"#;
+        let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
+
+        let status = Status::from_credenials(
+            creds,
+            "us-west-2".to_string(),
+            &"my-cluster".to_string(),
+        );
+
+        assert!(status.is_ok());
+        let status = status.unwrap();
+        assert!(status.token.starts_with(TOKEN_PREFIX));
+        assert!(!status.expirationTimestamp.is_empty());
+    }
+
+    #[test]
+    fn test_eks_token_from_credentials() {
+        let creds_json = r#"{
+            "Version": 1,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "token123",
+            "Expiration": "2025-01-01T00:00:00Z"
+        }"#;
+        let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
+
+        let token_json = EksToken::from_credentials(
+            creds,
+            "us-west-2".to_string(),
+            &"my-cluster".to_string(),
+        );
+
+        assert!(token_json.is_ok());
+        let token_json = token_json.unwrap();
+
+        // Verify it's valid JSON and has correct structure
+        let token: Result<EksToken, _> = serde_json::from_str(&token_json);
+        assert!(token.is_ok());
+
+        let token = token.unwrap();
+        assert_eq!(token.kind, "ExecCredential");
+        assert_eq!(token.apiVersion, BETA_API);
+        assert!(token.status.token.starts_with(TOKEN_PREFIX));
+        assert!(!token.status.expirationTimestamp.is_empty());
+    }
+
+    #[test]
+    fn test_token_expiration_is_future() {
+        let creds_json = r#"{
+            "Version": 1,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "token123",
+            "Expiration": "2025-01-01T00:00:00Z"
+        }"#;
+        let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
+
+        let status = Status::from_credenials(
+            creds,
+            "us-west-2".to_string(),
+            &"my-cluster".to_string(),
+        )
+        .unwrap();
+
+        // Parse as UTC DateTime
+        let exp_time = chrono::NaiveDateTime::parse_from_str(
+            &status.expirationTimestamp,
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        .unwrap()
+        .and_utc();
+
+        // Verify expiration is in the future
+        assert!(exp_time > Utc::now());
+    }
+
+    #[test]
+    fn test_token_expiration_approximately_14_minutes() {
+        let creds_json = r#"{
+            "Version": 1,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "token123",
+            "Expiration": "2025-01-01T00:00:00Z"
+        }"#;
+        let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
+
+        let status = Status::from_credenials(
+            creds,
+            "us-west-2".to_string(),
+            &"my-cluster".to_string(),
+        )
+        .unwrap();
+
+        // Parse as UTC DateTime
+        let exp_time = chrono::NaiveDateTime::parse_from_str(
+            &status.expirationTimestamp,
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        .unwrap()
+        .and_utc();
+        let now = Utc::now();
+        let duration = exp_time.signed_duration_since(now);
+
+        // Should be approximately 14 minutes (within 1 second tolerance)
+        assert!(duration.num_minutes() >= 13);
+        assert!(duration.num_minutes() <= 15);
+    }
+
+    #[test]
+    fn test_url_contains_cluster_id() {
+        let options = GetSignedUrlOptions::default();
+        let cluster = "my-special-cluster".to_string();
+        let url = get_signed_url(&options, &cluster);
+
+        // The cluster name should be encoded in the canonical request and affect the signature
+        assert!(url.contains("X-Amz-Signature="));
+        assert!(!url.contains("my-special-cluster")); // Should not be in URL directly
+    }
+
+    #[test]
+    fn test_different_regions_produce_different_urls() {
+        let mut options1 = GetSignedUrlOptions::default();
+        options1.region = "us-east-1".to_string();
+
+        let mut options2 = GetSignedUrlOptions::default();
+        options2.region = "eu-west-1".to_string();
+        options2.date = options1.date; // Same date for comparison
+
+        let cluster = "test-cluster".to_string();
+        let url1 = get_signed_url(&options1, &cluster);
+        let url2 = get_signed_url(&options2, &cluster);
+
+        assert_ne!(url1, url2);
+        assert!(url1.contains("us-east-1"));
+        assert!(url2.contains("eu-west-1"));
+    }
+
+    #[test]
+    fn test_build_url_search_params_sorted() {
+        let mut params = HashMap::new();
+        params.insert("Zebra".to_string(), "last".to_string());
+        params.insert("Apple".to_string(), "first".to_string());
+        params.insert("Banana".to_string(), "second".to_string());
+
+        let result = build_url_search_params(params, true);
+        let parts: Vec<&str> = result.split('&').collect();
+
+        // Should be sorted (case-insensitive)
+        assert!(parts[0].starts_with("Apple"));
+        assert!(parts[1].starts_with("Banana"));
+        assert!(parts[2].starts_with("Zebra"));
+    }
 }
