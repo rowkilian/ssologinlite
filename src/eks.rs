@@ -69,7 +69,7 @@ impl Status {
         );
         let url = get_signed_url(&signed_url, cluster);
         let encoded_url = base64_encode(&url).trim_end_matches('=').to_string();
-        let sanitized_encoded_url =  encoded_url.replace("/", "_");
+        let sanitized_encoded_url = encoded_url.replace("/", "_");
         let token = format!("{}{}", TOKEN_PREFIX, sanitized_encoded_url);
         // let token = format!("{}{}", TOKEN_PREFIX, base64_encode(&url));
         let expiration_timestamp = (Utc::now() + Duration::minutes(TOKEN_EXPIRATION_MINS))
@@ -464,11 +464,8 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let status = Status::from_credenials(
-            creds,
-            "us-west-2".to_string(),
-            &"my-cluster".to_string(),
-        );
+        let status =
+            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
 
         assert!(status.is_ok());
         let status = status.unwrap();
@@ -487,11 +484,8 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let token_json = EksToken::from_credentials(
-            creds,
-            "us-west-2".to_string(),
-            &"my-cluster".to_string(),
-        );
+        let token_json =
+            EksToken::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
 
         assert!(token_json.is_ok());
         let token_json = token_json.unwrap();
@@ -518,12 +512,9 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let status = Status::from_credenials(
-            creds,
-            "us-west-2".to_string(),
-            &"my-cluster".to_string(),
-        )
-        .unwrap();
+        let status =
+            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
+                .unwrap();
 
         // Parse as UTC DateTime
         let exp_time = chrono::NaiveDateTime::parse_from_str(
@@ -548,12 +539,9 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let status = Status::from_credenials(
-            creds,
-            "us-west-2".to_string(),
-            &"my-cluster".to_string(),
-        )
-        .unwrap();
+        let status =
+            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
+                .unwrap();
 
         // Parse as UTC DateTime
         let exp_time = chrono::NaiveDateTime::parse_from_str(

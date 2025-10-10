@@ -30,7 +30,7 @@ jobs:
 
   ensure_cargo_fmt:
     name: Ensure 'cargo fmt' has been run
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
@@ -51,7 +51,7 @@ jobs:
 
   min_version:
     name: Minimum supported rust version
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     needs: crate_metadata
     steps:
     - uses: actions/checkout@v4
