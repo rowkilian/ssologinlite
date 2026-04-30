@@ -1,7 +1,8 @@
 use crate::aws_credentials::AWScredentials;
 use crate::constants::{PROFILES, PROGRAM_FOLDER};
 use crate::file_helper::{
-    backup_config, get_aws_config, get_exe_path, get_home_os_string, restrict_file_permissions,
+    backup_config, create_restricted_file, get_aws_config, get_exe_path, get_home_os_string,
+    restrict_file_permissions,
 };
 use anyhow::{anyhow, Result};
 use ini::Ini;
@@ -210,8 +211,7 @@ impl Profiles {
     pub fn to_file(&self) -> Result<()> {
         info!("Writing profiles to my own managed file");
         let profile_json = get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, PROFILES).as_str())?;
-        restrict_file_permissions(&profile_json)?;
-        let mut file = match File::create(profile_json.clone()) {
+        let mut file = match create_restricted_file(&profile_json) {
             Ok(file) => file,
             Err(e) => {
                 error!("aws_profiles.Profiles.to_file {:?}", e);
@@ -232,7 +232,6 @@ impl Profiles {
                 return Err(anyhow!("Error writing to profile file"));
             }
         };
-        restrict_file_permissions(&profile_json)?;
         Ok(())
     }
 
@@ -255,16 +254,14 @@ impl Profiles {
         let existing_profiles = Profiles::from_existing_config()?;
 
         let profile_json = get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, PROFILES).as_str())?;
-        let _ = File::create(&profile_json)?;
 
-        let mut file = match File::create(&profile_json) {
+        let mut file = match create_restricted_file(&profile_json) {
             Ok(file) => file,
             Err(e) => {
                 error!("aws_profiles.Profiles.setup_file {:?}", e);
                 return Err(anyhow!("Error creating profile file"));
             }
         };
-        restrict_file_permissions(&profile_json)?;
         let data: String = match serde_json::to_string(&existing_profiles) {
             Ok(data) => data,
             Err(e) => {

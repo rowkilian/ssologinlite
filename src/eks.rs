@@ -315,12 +315,20 @@ fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool)
 
     key_value_list.sort_by_key(|a| a.to_lowercase());
     if !for_canonical {
-        (key_value_list[6], key_value_list[7]) =
-            (key_value_list[7].clone(), key_value_list[6].clone());
+        // Non-canonical (URL) form swaps X-Amz-Security-Token and X-Amz-SignedHeaders
+        // so Security-Token sits after SignedHeaders. Locating these by key prefix
+        // avoids a panic if the param set ever changes shape.
+        let token_idx = key_value_list
+            .iter()
+            .position(|s| s.starts_with("X-Amz-Security-Token="));
+        let signed_idx = key_value_list
+            .iter()
+            .position(|s| s.starts_with("X-Amz-SignedHeaders="));
+        if let (Some(t), Some(s)) = (token_idx, signed_idx) {
+            key_value_list.swap(t, s);
+        }
     };
-    let url_search_params: String = key_value_list.join("&");
-
-    url_search_params
+    key_value_list.join("&")
 }
 
 #[cfg(test)]

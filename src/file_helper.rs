@@ -4,8 +4,9 @@ use chrono::Local;
 use home::home_dir;
 use log::{debug, error};
 use std::ffi::OsString;
-use std::fs::{copy, metadata, set_permissions, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{copy, metadata, set_permissions, File, OpenOptions, Permissions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 pub fn backup_config() -> Result<()> {
     let aws_config = get_aws_config()?;
@@ -77,6 +78,40 @@ pub fn restrict_file_permissions(file: &OsString) -> Result<()> {
     let mut permissions = metadata(file)?.permissions();
     permissions.set_mode(perm);
     set_permissions(file, Permissions::from_mode(perm))?;
+    Ok(())
+}
+
+// Open a file for writing with mode 0o600 atomically on creation,
+// truncating existing content. If the file already exists with broader
+// permissions, chmod it to 0o600 before opening so the subsequent write
+// never lands in a world-readable file.
+pub fn create_restricted_file(file: &OsString) -> Result<File> {
+    if Path::new(file).exists() {
+        set_permissions(file, Permissions::from_mode(0o600))?;
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)
+        .map_err(|e| anyhow!(e))
+}
+
+// Ensure a file exists with mode 0o600 without truncating it. Used for
+// files whose contents are managed by an external library (e.g. PickleDb)
+// so that the library's writes land in a file with restricted permissions
+// from the start.
+pub fn ensure_restricted_file(file: &OsString) -> Result<()> {
+    if Path::new(file).exists() {
+        set_permissions(file, Permissions::from_mode(0o600))?;
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(file)?;
+    }
     Ok(())
 }
 
@@ -217,6 +252,80 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push("nonexistent_file_ssologinlite_test_12345");
         assert!(restrict_file_permissions(&OsString::from(path)).is_err());
+    }
+
+    // --- create_restricted_file() ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_restricted_file_new_file_is_0600() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = OsString::from(dir.path().join("new.txt").as_os_str());
+        let mut file = create_restricted_file(&path).unwrap();
+        use std::io::Write;
+        file.write_all(b"data").unwrap();
+        let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_restricted_file_chmods_existing_broad_perms() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_buf = dir.path().join("existing.txt");
+        std::fs::write(&path_buf, b"old contents").unwrap();
+        // Pre-existing file at 0o644 — common umask default.
+        set_permissions(&path_buf, Permissions::from_mode(0o644)).unwrap();
+
+        let path = OsString::from(path_buf.as_os_str());
+        let _file = create_restricted_file(&path).unwrap();
+        let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_create_restricted_file_truncates_existing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_buf = dir.path().join("existing.txt");
+        std::fs::write(&path_buf, b"old contents").unwrap();
+        let path = OsString::from(path_buf.as_os_str());
+        let _file = create_restricted_file(&path).unwrap();
+        // After create_restricted_file, the file is opened with truncate(true) —
+        // any reader sees an empty file until the caller writes.
+        assert_eq!(std::fs::read(&path_buf).unwrap(), b"");
+    }
+
+    // --- ensure_restricted_file() ---
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_restricted_file_creates_missing_with_0600() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_buf = dir.path().join("new.bin");
+        let path = OsString::from(path_buf.as_os_str());
+        ensure_restricted_file(&path).unwrap();
+        assert!(path_buf.exists());
+        let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_restricted_file_chmods_existing_without_truncating() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path_buf = dir.path().join("existing.bin");
+        std::fs::write(&path_buf, b"keep me").unwrap();
+        set_permissions(&path_buf, Permissions::from_mode(0o644)).unwrap();
+
+        let path = OsString::from(path_buf.as_os_str());
+        ensure_restricted_file(&path).unwrap();
+
+        let mode = metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // ensure_restricted_file is the non-truncating variant — contents must
+        // survive so a PickleDb load on the same path doesn't see an empty file.
+        assert_eq!(std::fs::read(&path_buf).unwrap(), b"keep me");
     }
 
     // --- MyErrors Display ---
