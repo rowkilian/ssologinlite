@@ -93,7 +93,12 @@ pub async fn get_cache(key: &str) -> Option<String> {
     debug!("getting {key} from cache.");
     // Lock down perms before reading so any subsequent write by another caller
     // (e.g. store_cache running in the same process) lands in a 0o600 file.
-    let _ = restrict_file_permissions(&str_cache_file);
+    if let Err(e) = restrict_file_permissions(&str_cache_file) {
+        error!(
+            "cache.get_cache: failed to restrict {} to 0o600: {}",
+            cache_str, e
+        );
+    }
     let db = match PickleDb::load_read_only(&str_cache_file, SerializationMethod::Bin) {
         Ok(res) => res,
         Err(e) => {

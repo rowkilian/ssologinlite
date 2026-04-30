@@ -87,7 +87,14 @@ pub fn logger(level: &str) -> Result<()> {
         }
     };
     // Log file is created by log4rs at default umask. Lock it down — operational
-    // URLs and IDs that end up in logs should not be world-readable.
-    let _ = restrict_file_permissions(&log_file);
+    // URLs and IDs that end up in logs should not be world-readable. We don't
+    // fail startup if chmod fails (the logger is already running and would emit
+    // the warning), but the failure must not be silent.
+    if let Err(e) = restrict_file_permissions(&log_file) {
+        error!(
+            "logger.logger: failed to restrict log file permissions to 0o600: {}",
+            e
+        );
+    }
     Ok(())
 }
