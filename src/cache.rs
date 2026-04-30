@@ -2,7 +2,7 @@ use crate::aws_credentials::AWScredentials;
 use crate::aws_sso_credentials::SsoCredentials;
 use crate::aws_sso_registration::SsoRegistration;
 use crate::constants::{CREDS_CACHE, PROGRAM_FOLDER};
-use crate::file_helper::{get_home_os_string, restrict_file_permissions};
+use crate::file_helper::{ensure_restricted_file, get_home_os_string, restrict_file_permissions};
 use anyhow::{anyhow, Result};
 use log::{debug, error, info};
 use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
@@ -91,6 +91,9 @@ pub async fn get_cache(key: &str) -> Option<String> {
     };
     debug!("opening cache file {} for reading.", &cache_str);
     debug!("getting {key} from cache.");
+    // Lock down perms before reading so any subsequent write by another caller
+    // (e.g. store_cache running in the same process) lands in a 0o600 file.
+    let _ = restrict_file_permissions(&str_cache_file);
     let db = match PickleDb::load_read_only(&str_cache_file, SerializationMethod::Bin) {
         Ok(res) => res,
         Err(e) => {
@@ -98,8 +101,6 @@ pub async fn get_cache(key: &str) -> Option<String> {
             return None;
         }
     };
-
-    let _ = restrict_file_permissions(&str_cache_file);
     db.get::<String>(key)
 }
 
@@ -125,6 +126,14 @@ where
         }
     };
     info!("opening cache file {} for writing.", cache_str);
+    // Pre-create / chmod the cache file to 0o600 BEFORE PickleDb's first dump,
+    // otherwise the dump creates the file at the umask default (typically 0o644)
+    // and cached access tokens / client secrets briefly live in a world-readable
+    // file.
+    if let Err(e) = ensure_restricted_file(&str_cache_file) {
+        error!("cache.store_cache.ensure_restricted_file: {}", e);
+        return Err(anyhow!(MyErrors::Cache));
+    }
     let mut db = PickleDb::load(
         str_cache_file.clone(),
         PickleDbDumpPolicy::AutoDump,
@@ -135,7 +144,6 @@ where
         PickleDbDumpPolicy::AutoDump,
         SerializationMethod::Bin,
     ));
-    let _ = restrict_file_permissions(&str_cache_file);
     let j_creds = match serde_json::to_string(object) {
         Ok(j_creds) => j_creds,
         Err(e) => {

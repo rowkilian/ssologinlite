@@ -1,5 +1,5 @@
 use crate::constants::PROGRAM_FOLDER;
-use crate::file_helper::get_home_os_string;
+use crate::file_helper::{get_home_os_string, restrict_file_permissions};
 use anyhow::{anyhow, Result};
 use log::error;
 use log::LevelFilter;
@@ -86,5 +86,8 @@ pub fn logger(level: &str) -> Result<()> {
             return Err(anyhow!(e));
         }
     };
+    // Log file is created by log4rs at default umask. Lock it down — operational
+    // URLs and IDs that end up in logs should not be world-readable.
+    let _ = restrict_file_permissions(&log_file);
     Ok(())
 }

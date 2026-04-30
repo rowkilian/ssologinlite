@@ -4,8 +4,9 @@ use chrono::Local;
 use home::home_dir;
 use log::{debug, error};
 use std::ffi::OsString;
-use std::fs::{copy, metadata, set_permissions, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::fs::{copy, metadata, set_permissions, File, OpenOptions, Permissions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 pub fn backup_config() -> Result<()> {
     let aws_config = get_aws_config()?;
@@ -77,6 +78,40 @@ pub fn restrict_file_permissions(file: &OsString) -> Result<()> {
     let mut permissions = metadata(file)?.permissions();
     permissions.set_mode(perm);
     set_permissions(file, Permissions::from_mode(perm))?;
+    Ok(())
+}
+
+// Open a file for writing with mode 0o600 atomically on creation,
+// truncating existing content. If the file already exists with broader
+// permissions, chmod it to 0o600 before opening so the subsequent write
+// never lands in a world-readable file.
+pub fn create_restricted_file(file: &OsString) -> Result<File> {
+    if Path::new(file).exists() {
+        set_permissions(file, Permissions::from_mode(0o600))?;
+    }
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)
+        .map_err(|e| anyhow!(e))
+}
+
+// Ensure a file exists with mode 0o600 without truncating it. Used for
+// files whose contents are managed by an external library (e.g. PickleDb)
+// so that the library's writes land in a file with restricted permissions
+// from the start.
+pub fn ensure_restricted_file(file: &OsString) -> Result<()> {
+    if Path::new(file).exists() {
+        set_permissions(file, Permissions::from_mode(0o600))?;
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(file)?;
+    }
     Ok(())
 }
 

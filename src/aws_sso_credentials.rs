@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use aws_config::sso::credentials::Builder;
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
-use chrono::{Duration, Local, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime, Utc};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::thread;
@@ -90,7 +90,9 @@ impl SsoCredentials {
                 return Err(anyhow!(MyErrors::GetUrlError));
             }
         };
-        debug!("opening browser with url: {}", url_as_str);
+        // The verification URL embeds the user_code; logging it would let anyone
+        // with read access to the log complete the SSO authorization as the user.
+        debug!("opening browser to complete SSO authorization");
         if open_url(conf, url_as_str.clone()).is_ok() {
             loop {
                 debug!("wating 1 second");
@@ -209,7 +211,7 @@ impl SsoCredentials {
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
             }
         };
-        let expiration = Local::now().naive_local() + Duration::seconds(output.expires_in.into());
+        let expiration = Utc::now() + Duration::seconds(output.expires_in.into());
         let url = profile.sso_start_url.clone();
         let mut hash_url = sha1_smol::Sha1::new();
         hash_url.update(url.as_bytes());
@@ -227,8 +229,9 @@ impl SsoCredentials {
 
     pub fn expires(&self) -> Result<(chrono::Duration, bool)> {
         info!("checking token expiration");
-        let now = Local::now().naive_local();
-        // let st_exp: &str = &self.expiresAt[..];
+        // expiresAt is written with the Z suffix in create_token from a Utc
+        // timestamp, so compare against Utc::now() to avoid a local-offset skew.
+        let now = Utc::now().naive_utc();
         let pre_exp = &self.expiresAt;
         let exp_dt = match NaiveDateTime::parse_from_str(&pre_exp[..], "%Y-%m-%dT%H:%M:%SZ") {
             Ok(expiration) => expiration,
@@ -290,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_expires_future_date() {
-        let future = (Local::now().naive_local() + Duration::hours(2))
+        let future = (Utc::now().naive_utc() + Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&future);
@@ -301,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_expires_past_date() {
-        let past = (Local::now().naive_local() - Duration::hours(2))
+        let past = (Utc::now().naive_utc() - Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&past);
@@ -326,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_is_expired_future() {
-        let future = (Local::now().naive_local() + Duration::hours(2))
+        let future = (Utc::now().naive_utc() + Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&future);
@@ -335,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_is_expired_past() {
-        let past = (Local::now().naive_local() - Duration::hours(2))
+        let past = (Utc::now().naive_utc() - Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&past);
@@ -437,7 +440,7 @@ mod tests {
     proptest! {
         #[test]
         fn test_expires_sign_matches_bool(offset in -168i64..168i64) {
-            let dt = Local::now().naive_local() + Duration::hours(offset);
+            let dt = Utc::now().naive_utc() + Duration::hours(offset);
             let formatted = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let creds = make_creds(&formatted);
             if let Ok((dur, expired)) = creds.expires() {
