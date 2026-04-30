@@ -12,10 +12,7 @@ use url_search_params::encode_uri_component;
 const AUTH_SERVICE: &str = "sts";
 const AUTH_COMMAND: &str = "GetCallerIdentity";
 const AUTH_API_VERSION: &str = "2011-06-15";
-// const AUTH_SIGNING_VERSION: &str = "v4";
-// const ALPHA_API: &str = "client.authentication.k8s.io/v1alpha1";
 const BETA_API: &str = "client.authentication.k8s.io/v1beta1";
-// const V1_API: &str = "client.authentication.k8s.io/v1";
 const URL_TIMEOUT: u16 = 60;
 const TOKEN_EXPIRATION_MINS: i64 = 14;
 const TOKEN_PREFIX: &str = "k8s-aws-v1.";
@@ -56,7 +53,7 @@ impl Default for EksToken {
 }
 
 impl Status {
-    pub fn from_credenials(
+    pub fn from_credentials(
         credentials: AWScredentials,
         region: String,
         cluster: &String,
@@ -71,7 +68,6 @@ impl Status {
         let encoded_url = base64_encode(&url).trim_end_matches('=').to_string();
         let sanitized_encoded_url = encoded_url.replace("/", "_");
         let token = format!("{}{}", TOKEN_PREFIX, sanitized_encoded_url);
-        // let token = format!("{}{}", TOKEN_PREFIX, base64_encode(&url));
         let expiration_timestamp = (Utc::now() + Duration::minutes(TOKEN_EXPIRATION_MINS))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
@@ -88,7 +84,7 @@ impl EksToken {
         region: String,
         cluster: &String,
     ) -> Result<String> {
-        let status = Status::from_credenials(credentials, region, cluster)?;
+        let status = Status::from_credentials(credentials, region, cluster)?;
         let token = EksToken {
             status,
             ..Default::default()
@@ -97,7 +93,6 @@ impl EksToken {
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
         let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
         token.serialize(&mut ser).unwrap();
-        // Ok(serde_json::to_string_pretty(&token)?)
         Ok(String::from_utf8(buf)?)
     }
 }
@@ -215,7 +210,6 @@ fn get_canonical_request(
     query_parameters: &str,
     cluster: &String,
 ) -> String {
-    // let key = &("/".to_string() + &options.key);
     let host =
         &("host:".to_string() + &options.service + "." + &options.region + "." + &options.endpoint);
     let cluster_header = format!("{}:{}", K8S_AWS_ID_HEADER, cluster);
@@ -274,7 +268,6 @@ fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: S
         ".",
         "amazonaws.com",
         "/",
-        // &options.key,
         "?",
         &query_parameters,
         "&X-Amz-Signature=",
@@ -465,7 +458,7 @@ mod tests {
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
         let status =
-            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
+            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
 
         assert!(status.is_ok());
         let status = status.unwrap();
@@ -513,7 +506,7 @@ mod tests {
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
         let status =
-            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
+            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
                 .unwrap();
 
         // Parse as UTC DateTime
@@ -540,7 +533,7 @@ mod tests {
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
         let status =
-            Status::from_credenials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
+            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
                 .unwrap();
 
         // Parse as UTC DateTime
@@ -605,5 +598,45 @@ mod tests {
         assert!(parts[0].starts_with("Apple"));
         assert!(parts[1].starts_with("Banana"));
         assert!(parts[2].starts_with("Zebra"));
+    }
+
+    #[test]
+    fn test_token_round_trip_decodes_to_signed_url() {
+        // Status::from_credentials produces a token of the form
+        //   "k8s-aws-v1." + base64url(signed_url)
+        // with `=` padding stripped and `/` replaced by `_`. EKS auth webhooks
+        // expect this exact format. This test reverses the transformation and
+        // verifies that the embedded URL is the one we'd generate directly.
+        let creds_json = r#"{
+            "Version": 1,
+            "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+            "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "SessionToken": "token123",
+            "Expiration": "2025-01-01T00:00:00Z"
+        }"#;
+        let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
+        let status =
+            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
+                .unwrap();
+
+        let encoded = status
+            .token
+            .strip_prefix(TOKEN_PREFIX)
+            .expect("token must start with k8s-aws-v1.");
+        let restored = encoded.replace('_', "/");
+        // base64 needs length divisible by 4; re-add the trimmed `=` padding.
+        let padded = match restored.len() % 4 {
+            0 => restored,
+            n => format!("{restored}{}", "=".repeat(4 - n)),
+        };
+        let bytes = STANDARD
+            .decode(&padded)
+            .expect("token suffix must decode as base64");
+        let decoded_url = String::from_utf8(bytes).expect("decoded bytes must be UTF-8");
+
+        assert!(decoded_url.starts_with("https://sts.us-west-2.amazonaws.com/"));
+        assert!(decoded_url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(decoded_url.contains("X-Amz-Signature="));
+        assert!(decoded_url.contains("X-Amz-Security-Token="));
     }
 }

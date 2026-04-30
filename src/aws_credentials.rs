@@ -43,29 +43,40 @@ impl AWScredentials {
         now > exp_dt
     }
 
-    pub async fn get_role_credentials(profile: SsoProfile) -> Result<Self> {
-        info!("Getting role credentials");
-        let credentials = get_cached_credentials(profile.profile_name.as_str()).await;
-        let creds_ = credentials.filter(|creds| !creds.is_expired());
-        match creds_ {
+    // Cache-or-fetch helper. Looks up credentials by profile name in the local
+    // cache, returning them if still valid; otherwise calls the supplied AWS
+    // fetch closure, stores the result, and returns it. Centralises the
+    // identical control flow shared by get_role_credentials and get_assume_role.
+    async fn get_or_refresh<F, Fut>(cache_key: &str, fetch_from_aws: F) -> Result<Self>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Self>>,
+    {
+        let credentials = get_cached_credentials(cache_key).await;
+        match credentials.filter(|creds| !creds.is_expired()) {
             Some(creds) => {
-                debug!("aws_credentials.AWScredentials.get_role_credentials.creds from Cache still valid");
+                debug!("aws_credentials.AWScredentials.get_or_refresh: cached credentials for {} still valid", cache_key);
                 Ok(creds)
             }
             None => {
-                debug!("aws_credentials.AWScredentials.get_role_credentials.creds expired retrieving from AWS");
-                let creds = Self::get_role_credentials_from_aws(profile.clone()).await;
-                let mycreds = match creds.as_ref() {
-                    Ok(creds) => creds,
-                    Err(e) => {
-                        error!("aws_credentials.AWScredentials.get_role_credentials {}", e);
-                        return Err(anyhow!(MyErrors::ExpirationParser));
-                    }
-                };
-                store_cached_credentials(&profile.profile_name, mycreds).await?;
-                creds
+                debug!("aws_credentials.AWScredentials.get_or_refresh: refreshing credentials for {} from AWS", cache_key);
+                let creds = fetch_from_aws().await.map_err(|e| {
+                    error!("aws_credentials.AWScredentials.get_or_refresh {}", e);
+                    e
+                })?;
+                store_cached_credentials(cache_key, &creds).await?;
+                Ok(creds)
             }
         }
+    }
+
+    pub async fn get_role_credentials(profile: SsoProfile) -> Result<Self> {
+        info!("Getting role credentials");
+        let cache_key = profile.profile_name.clone();
+        Self::get_or_refresh(&cache_key, move || {
+            Self::get_role_credentials_from_aws(profile)
+        })
+        .await
     }
 
     pub async fn get_assume_role(
@@ -73,31 +84,11 @@ impl AWScredentials {
         sso_profile: SsoProfile,
     ) -> Result<Self> {
         info!("Getting assume role credentials");
-        let credentials = get_cached_credentials(assume_profile.profile_name.as_str()).await;
-        let creds_ = credentials.filter(|creds| !creds.is_expired());
-        match creds_ {
-            Some(creds) => {
-                debug!(
-                    "aws_credentials.AWScredentials.get_assume_role.creds from Cache still valid"
-                );
-                Ok(creds)
-            }
-            None => {
-                debug!("aws_credentials.AWScredentials.get_assume_role.creds expired retrieving from AWS");
-                let creds =
-                    Self::get_assume_role_from_aws(assume_profile.clone(), sso_profile.clone())
-                        .await;
-                let mycreds = match creds.as_ref() {
-                    Ok(creds) => creds,
-                    Err(e) => {
-                        error!("aws_credentials.AWScredentials.get_assume_role {}", e);
-                        return Err(anyhow!(MyErrors::GetRoleCredentialError));
-                    }
-                };
-                store_cached_credentials(assume_profile.profile_name.as_str(), mycreds).await?;
-                creds
-            }
-        }
+        let cache_key = assume_profile.profile_name.clone();
+        Self::get_or_refresh(&cache_key, move || {
+            Self::get_assume_role_from_aws(assume_profile, sso_profile)
+        })
+        .await
     }
 
     async fn get_role_credentials_from_aws(profile: SsoProfile) -> Result<Self> {
@@ -281,7 +272,6 @@ impl AWScredentials {
 
 #[derive(Debug)]
 enum MyErrors {
-    ExpirationParser,
     GetRoleCredentialError,
     GetRoleCredentialAccessKeyError,
     GetRoleCredentialSecretKeyError,
@@ -293,7 +283,6 @@ enum MyErrors {
 impl std::fmt::Display for MyErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExpirationParser => write!(f, "Could not parse AWS expiration date!"),
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::AssumeRoleError => write!(f, "Error getting Assume Role from AWS!"),
             Self::GetRoleCredentialAccessKeyError => {

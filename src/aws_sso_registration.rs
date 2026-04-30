@@ -19,19 +19,19 @@ pub struct SsoRegistration {
 }
 
 impl SsoRegistration {
-    pub async fn get() -> Result<SsoRegistration> {
+    pub async fn get(sso_region: &str) -> Result<SsoRegistration> {
         match SsoRegistration::from_cache().await {
             Some(reg) => {
                 if reg.is_expired() {
                     info!("SSO registration is expired. Registering new client.");
-                    SsoRegistration::register_client().await
+                    SsoRegistration::register_client(sso_region).await
                 } else {
                     Ok(reg)
                 }
             }
             None => {
                 info!("No SSO registration found. Registering new client.");
-                SsoRegistration::register_client().await
+                SsoRegistration::register_client(sso_region).await
             }
         }
     }
@@ -59,9 +59,8 @@ impl SsoRegistration {
         now > exp_dt
     }
 
-    pub async fn register_client() -> Result<SsoRegistration> {
-        let sso_region = "us-west-2";
-        let sdkregion = sdkRegion::new(sso_region);
+    pub async fn register_client(sso_region: &str) -> Result<SsoRegistration> {
+        let sdkregion = sdkRegion::new(sso_region.to_string());
 
         let config = aws_sdk_ssooidc::Config::builder()
             .region(sdkregion)
@@ -99,7 +98,6 @@ impl SsoRegistration {
             }
         };
         let timestamp = output.client_secret_expires_at;
-        // let naive = NaiveDateTime::from_timestamp(timestamp, 0);
         let datetime: DateTime<Utc> = match DateTime::from_timestamp(timestamp, 0) {
             Some(dt) => dt,
             None => {
@@ -107,7 +105,6 @@ impl SsoRegistration {
             }
         };
 
-        // self.registrationExpiresAt = datetime.to_rfc3339();
         let res = SsoRegistration {
             clientSecret: client_secret,
             clientId: client_id,
