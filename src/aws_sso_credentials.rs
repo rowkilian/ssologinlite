@@ -265,7 +265,7 @@ enum MyErrors {
 impl std::fmt::Display for MyErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExpirationParser => write!(f, "Could no parse AWS expiration date!"),
+            Self::ExpirationParser => write!(f, "Could not parse AWS expiration date!"),
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::GetUrlError => write!(f, "Error getting URL!"),
             Self::CredentialsFromURLError => write!(f, "Error getting credentials with URL!"),
@@ -405,7 +405,7 @@ mod tests {
     fn test_error_display_expiration_parser() {
         assert_eq!(
             format!("{}", MyErrors::ExpirationParser),
-            "Could no parse AWS expiration date!"
+            "Could not parse AWS expiration date!"
         );
     }
 

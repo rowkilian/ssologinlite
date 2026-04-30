@@ -43,8 +43,14 @@ impl ProgramConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    // Tests that read or mutate process-global env vars share a serialization
+    // group via #[serial] — Rust runs tests in parallel by default, so a sibling
+    // test could observe a mid-mutation env var and flake.
 
     #[test]
+    #[serial(env_vars)]
     fn test_new_loads_without_crash() {
         // .required(false) means missing config file is OK
         let result = ProgramConfig::new();
@@ -52,6 +58,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_env_var_browser() {
         std::env::set_var("SSOLOGINLITE_BROWSER", "firefox");
         let conf = ProgramConfig::new().unwrap();
@@ -60,6 +67,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_env_var_default_sso_url() {
         std::env::set_var(
             "SSOLOGINLITE_DEFAULT_SSO_URL",

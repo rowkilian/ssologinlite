@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use log::{debug, error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -41,16 +41,18 @@ impl SsoRegistration {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = Local::now().naive_local();
-        // let st_exp: &str = &self.expiresAt[..];
-        let exp_dt = match NaiveDateTime::parse_from_str(&self.expiresAt[..], "%Y-%m-%dT%H:%M:%S%z")
-        {
-            Ok(expiration) => expiration,
+        // parse_from_rfc3339 accepts every valid RFC3339 timestamp (with or
+        // without fractional seconds, with `Z` or `+HH:MM` offset) and is
+        // timezone-aware, so comparing against Utc::now() is correct in any
+        // local timezone.
+        let exp_dt = match DateTime::parse_from_rfc3339(&self.expiresAt) {
+            Ok(expiration) => expiration.with_timezone(&Utc),
             Err(e) => {
                 error!("{}", e);
                 return true;
             }
         };
+        let now = Utc::now();
         debug!("SsoRegistration.is_expired.now {:?}", now);
         debug!("SsoRegistration.is_expired.exp_dt {:?}", exp_dt);
         debug!("SsoRegistration.is_expired.is_expired {:?}", now > exp_dt);
@@ -109,7 +111,7 @@ impl SsoRegistration {
         let res = SsoRegistration {
             clientSecret: client_secret,
             clientId: client_id,
-            expiresAt: datetime.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(),
+            expiresAt: datetime.to_rfc3339(),
         };
         cache_sso_registration(&res).await?;
         Ok(res)
@@ -148,19 +150,14 @@ mod tests {
 
     #[test]
     fn test_is_expired_future_rfc3339() {
-        // is_expired() parses with "%Y-%m-%dT%H:%M:%S%z" — no fractional seconds
-        let future = (Utc::now() + chrono::Duration::hours(2))
-            .format("%Y-%m-%dT%H:%M:%S+00:00")
-            .to_string();
+        let future = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         let reg = make_reg(&future);
         assert!(!reg.is_expired());
     }
 
     #[test]
     fn test_is_expired_past_rfc3339() {
-        let past = (Utc::now() - chrono::Duration::hours(2))
-            .format("%Y-%m-%dT%H:%M:%S+00:00")
-            .to_string();
+        let past = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let reg = make_reg(&past);
         assert!(reg.is_expired());
     }
@@ -177,21 +174,35 @@ mod tests {
         assert!(reg.is_expired());
     }
 
-    // --- Regression: register_client() format must be parseable by is_expired() ---
+    // --- Cross-format compatibility: is_expired() must accept any RFC3339 ---
 
     #[test]
-    fn test_register_client_format_parseable_by_is_expired() {
-        // register_client() now stores "%Y-%m-%dT%H:%M:%S+00:00" (no nanoseconds)
-        // which is_expired() can parse with "%Y-%m-%dT%H:%M:%S%z"
+    fn test_is_expired_accepts_rfc3339_with_nanoseconds() {
+        // to_rfc3339() emits fractional seconds. Old cached registration files
+        // may use this format; is_expired() must continue to parse them.
+        let future = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        assert!(
+            future.contains('.'),
+            "to_rfc3339() should include fractional seconds: {future}"
+        );
+        assert!(!make_reg(&future).is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_accepts_offset_without_fractional_seconds() {
+        // Format previously emitted by register_client() (no fractional seconds).
         let future = (Utc::now() + chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%S+00:00")
             .to_string();
-        let reg = make_reg(&future);
-        assert!(
-            !reg.is_expired(),
-            "Future date should not be expired: {}",
-            future
-        );
+        assert!(!make_reg(&future).is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_accepts_z_suffix() {
+        let future = (Utc::now() + chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        assert!(!make_reg(&future).is_expired());
     }
 
     // --- Serde ---

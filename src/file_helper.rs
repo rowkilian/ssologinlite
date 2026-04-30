@@ -99,44 +99,72 @@ impl std::fmt::Display for MyErrors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::path::Path;
+
+    // home_dir() reads HOME (USERPROFILE on Windows) live, so tests that depend
+    // on it set HOME to a tempdir for determinism in CI/sandbox environments
+    // where the real home may be missing or non-writable. Env-var mutation is
+    // process-global, hence #[serial].
+    fn with_temp_home(f: impl FnOnce(&Path)) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(tmp.path())));
+        match saved {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     // --- get_home_os_string() ---
 
     #[test]
+    #[serial(env_vars)]
     fn test_get_home_os_string_returns_ok() {
-        let result = get_home_os_string(".aws/config");
-        assert!(result.is_ok());
+        with_temp_home(|_| {
+            assert!(get_home_os_string(".aws/config").is_ok());
+        });
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_get_home_os_string_contains_segments() {
-        let result = get_home_os_string(".aws/config").unwrap();
-        let path = Path::new(&result);
-        assert!(path.ends_with(".aws/config"));
+        with_temp_home(|_| {
+            let result = get_home_os_string(".aws/config").unwrap();
+            assert!(Path::new(&result).ends_with(".aws/config"));
+        });
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_get_home_os_string_starts_with_home() {
-        let result = get_home_os_string("test/file").unwrap();
-        let home = home_dir().unwrap();
-        let path = Path::new(&result);
-        assert!(path.starts_with(&home));
+        with_temp_home(|home| {
+            let result = get_home_os_string("test/file").unwrap();
+            assert!(Path::new(&result).starts_with(home));
+        });
     }
 
     // --- get_aws_config() ---
 
     #[test]
+    #[serial(env_vars)]
     fn test_get_aws_config_returns_ok() {
-        let result = get_aws_config();
-        assert!(result.is_ok());
+        with_temp_home(|_| {
+            assert!(get_aws_config().is_ok());
+        });
     }
 
     #[test]
+    #[serial(env_vars)]
     fn test_get_aws_config_ends_with_aws_config() {
-        let result = get_aws_config().unwrap();
-        let path = Path::new(&result);
-        assert!(path.ends_with(".aws/config"));
+        with_temp_home(|_| {
+            let result = get_aws_config().unwrap();
+            assert!(Path::new(&result).ends_with(".aws/config"));
+        });
     }
 
     // --- get_exe_path() ---
@@ -169,7 +197,10 @@ mod tests {
     }
 
     // --- restrict_file_permissions() ---
+    // restrict_file_permissions uses Unix-only PermissionsExt::set_mode, so the
+    // tests are gated to Unix targets.
 
+    #[cfg(unix)]
     #[test]
     fn test_restrict_file_permissions_sets_600() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -180,10 +211,12 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_restrict_file_permissions_nonexistent_errors() {
-        let path = OsString::from("/tmp/nonexistent_file_ssologinlite_test_12345");
-        assert!(restrict_file_permissions(&path).is_err());
+        let mut path = std::env::temp_dir();
+        path.push("nonexistent_file_ssologinlite_test_12345");
+        assert!(restrict_file_permissions(&OsString::from(path)).is_err());
     }
 
     // --- MyErrors Display ---
