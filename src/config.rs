@@ -39,3 +39,87 @@ impl ProgramConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    // Tests that read or mutate process-global env vars share a serialization
+    // group via #[serial] — Rust runs tests in parallel by default, so a sibling
+    // test could observe a mid-mutation env var and flake.
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_new_loads_without_crash() {
+        // .required(false) means missing config file is OK
+        let result = ProgramConfig::new();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_env_var_browser() {
+        std::env::set_var("SSOLOGINLITE_BROWSER", "firefox");
+        let conf = ProgramConfig::new().unwrap();
+        assert_eq!(conf.browser.as_deref(), Some("firefox"));
+        std::env::remove_var("SSOLOGINLITE_BROWSER");
+    }
+
+    #[test]
+    #[serial(env_vars)]
+    fn test_env_var_default_sso_url() {
+        std::env::set_var(
+            "SSOLOGINLITE_DEFAULT_SSO_URL",
+            "https://my-sso.awsapps.com/start",
+        );
+        let conf = ProgramConfig::new().unwrap();
+        assert_eq!(
+            conf.default_sso_url.as_deref(),
+            Some("https://my-sso.awsapps.com/start")
+        );
+        std::env::remove_var("SSOLOGINLITE_DEFAULT_SSO_URL");
+    }
+
+    #[test]
+    fn test_serde_round_trip_some() {
+        let conf = ProgramConfig {
+            browser: Some("chrome".to_string()),
+            default_sso_url: Some("https://url".to_string()),
+        };
+        let json = serde_json::to_string(&conf).unwrap();
+        let deser: ProgramConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.browser, conf.browser);
+        assert_eq!(deser.default_sso_url, conf.default_sso_url);
+    }
+
+    #[test]
+    fn test_serde_round_trip_none() {
+        let conf = ProgramConfig {
+            browser: None,
+            default_sso_url: None,
+        };
+        let json = serde_json::to_string(&conf).unwrap();
+        let deser: ProgramConfig = serde_json::from_str(&json).unwrap();
+        assert!(deser.browser.is_none());
+        assert!(deser.default_sso_url.is_none());
+    }
+
+    #[test]
+    fn test_default() {
+        let conf = ProgramConfig::default();
+        assert!(conf.browser.is_none());
+        assert!(conf.default_sso_url.is_none());
+    }
+
+    #[test]
+    fn test_clone() {
+        let conf = ProgramConfig {
+            browser: Some("safari".to_string()),
+            default_sso_url: None,
+        };
+        let cloned = conf.clone();
+        assert_eq!(cloned.browser, conf.browser);
+        assert_eq!(cloned.default_sso_url, conf.default_sso_url);
+    }
+}

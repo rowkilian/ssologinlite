@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use log::{debug, error, info};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -41,16 +41,18 @@ impl SsoRegistration {
     }
 
     pub fn is_expired(&self) -> bool {
-        let now = Local::now().naive_local();
-        // let st_exp: &str = &self.expiresAt[..];
-        let exp_dt = match NaiveDateTime::parse_from_str(&self.expiresAt[..], "%Y-%m-%dT%H:%M:%S%z")
-        {
-            Ok(expiration) => expiration,
+        // parse_from_rfc3339 accepts every valid RFC3339 timestamp (with or
+        // without fractional seconds, with `Z` or `+HH:MM` offset) and is
+        // timezone-aware, so comparing against Utc::now() is correct in any
+        // local timezone.
+        let exp_dt = match DateTime::parse_from_rfc3339(&self.expiresAt) {
+            Ok(expiration) => expiration.with_timezone(&Utc),
             Err(e) => {
                 error!("{}", e);
                 return true;
             }
         };
+        let now = Utc::now();
         debug!("SsoRegistration.is_expired.now {:?}", now);
         debug!("SsoRegistration.is_expired.exp_dt {:?}", exp_dt);
         debug!("SsoRegistration.is_expired.is_expired {:?}", now > exp_dt);
@@ -129,5 +131,136 @@ impl std::fmt::Display for MyErrors {
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::RegisterClientError => write!(f, "Error registering client!"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_reg(expires_at: &str) -> SsoRegistration {
+        SsoRegistration {
+            clientSecret: "secret-123".to_string(),
+            clientId: "client-456".to_string(),
+            expiresAt: expires_at.to_string(),
+        }
+    }
+
+    // --- is_expired() ---
+
+    #[test]
+    fn test_is_expired_future_rfc3339() {
+        let future = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let reg = make_reg(&future);
+        assert!(!reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_past_rfc3339() {
+        let past = (Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let reg = make_reg(&past);
+        assert!(reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_format() {
+        let reg = make_reg("not-a-date");
+        assert!(reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_empty_string() {
+        let reg = make_reg("");
+        assert!(reg.is_expired());
+    }
+
+    // --- Cross-format compatibility: is_expired() must accept any RFC3339 ---
+
+    #[test]
+    fn test_is_expired_accepts_rfc3339_with_nanoseconds() {
+        // to_rfc3339() emits fractional seconds. Old cached registration files
+        // may use this format; is_expired() must continue to parse them.
+        let future = (Utc::now() + chrono::Duration::hours(24)).to_rfc3339();
+        assert!(
+            future.contains('.'),
+            "to_rfc3339() should include fractional seconds: {future}"
+        );
+        assert!(!make_reg(&future).is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_accepts_offset_without_fractional_seconds() {
+        // Format previously emitted by register_client() (no fractional seconds).
+        let future = (Utc::now() + chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        assert!(!make_reg(&future).is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_accepts_z_suffix() {
+        let future = (Utc::now() + chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        assert!(!make_reg(&future).is_expired());
+    }
+
+    // --- Serde ---
+
+    #[test]
+    fn test_sso_registration_serde_round_trip() {
+        let reg = make_reg("2099-01-01T00:00:00+00:00");
+        let json = serde_json::to_string(&reg).unwrap();
+        let deser: SsoRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.clientSecret, reg.clientSecret);
+        assert_eq!(deser.clientId, reg.clientId);
+        assert_eq!(deser.expiresAt, reg.expiresAt);
+    }
+
+    #[test]
+    fn test_sso_registration_deserialize_from_json() {
+        let json = r#"{"clientSecret":"s","clientId":"c","expiresAt":"2099-01-01T00:00:00+00:00"}"#;
+        let reg: SsoRegistration = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.clientSecret, "s");
+        assert_eq!(reg.clientId, "c");
+    }
+
+    // --- Default ---
+
+    #[test]
+    fn test_sso_registration_default() {
+        let reg = SsoRegistration::default();
+        assert_eq!(reg.clientSecret, "");
+        assert_eq!(reg.clientId, "");
+        assert_eq!(reg.expiresAt, "");
+    }
+
+    // --- Clone ---
+
+    #[test]
+    fn test_sso_registration_clone() {
+        let reg = make_reg("2099-01-01T00:00:00+00:00");
+        let cloned = reg.clone();
+        assert_eq!(cloned.clientSecret, reg.clientSecret);
+        assert_eq!(cloned.clientId, reg.clientId);
+        assert_eq!(cloned.expiresAt, reg.expiresAt);
+    }
+
+    // --- MyErrors Display ---
+
+    #[test]
+    fn test_error_display_get_role_credential() {
+        assert_eq!(
+            format!("{}", MyErrors::GetRoleCredentialError),
+            "Error getting credentials!"
+        );
+    }
+
+    #[test]
+    fn test_error_display_register_client() {
+        assert_eq!(
+            format!("{}", MyErrors::RegisterClientError),
+            "Error registering client!"
+        );
     }
 }

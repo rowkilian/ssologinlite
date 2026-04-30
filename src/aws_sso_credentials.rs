@@ -265,10 +265,190 @@ enum MyErrors {
 impl std::fmt::Display for MyErrors {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ExpirationParser => write!(f, "Could no parse AWS expiration date!"),
+            Self::ExpirationParser => write!(f, "Could not parse AWS expiration date!"),
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::GetUrlError => write!(f, "Error getting URL!"),
             Self::CredentialsFromURLError => write!(f, "Error getting credentials with URL!"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_creds(expires_at: &str) -> SsoCredentials {
+        SsoCredentials {
+            expiresAt: expires_at.to_string(),
+            region: "us-west-2".to_string(),
+            startUrl: "https://my-sso.awsapps.com/start".to_string(),
+            accessToken: "test-access-token-123".to_string(),
+        }
+    }
+
+    // --- expires() ---
+
+    #[test]
+    fn test_expires_future_date() {
+        let future = (Local::now().naive_local() + Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let creds = make_creds(&future);
+        let (dur, expired) = creds.expires().unwrap();
+        assert!(!expired);
+        assert!(dur.num_minutes() > 100);
+    }
+
+    #[test]
+    fn test_expires_past_date() {
+        let past = (Local::now().naive_local() - Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let creds = make_creds(&past);
+        let (dur, expired) = creds.expires().unwrap();
+        assert!(expired);
+        assert!(dur.num_minutes() < 0);
+    }
+
+    #[test]
+    fn test_expires_invalid_format() {
+        let creds = make_creds("not-a-date");
+        assert!(creds.expires().is_err());
+    }
+
+    #[test]
+    fn test_expires_empty_string() {
+        let creds = make_creds("");
+        assert!(creds.expires().is_err());
+    }
+
+    // --- is_expired() ---
+
+    #[test]
+    fn test_is_expired_future() {
+        let future = (Local::now().naive_local() + Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let creds = make_creds(&future);
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_past() {
+        let past = (Local::now().naive_local() - Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let creds = make_creds(&past);
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_returns_true() {
+        let creds = make_creds("garbage");
+        assert!(creds.is_expired());
+    }
+
+    // --- get_access_token() ---
+
+    #[test]
+    fn test_get_access_token() {
+        let creds = make_creds("2099-01-01T00:00:00Z");
+        assert_eq!(creds.get_access_token(), "test-access-token-123");
+    }
+
+    // --- Serde ---
+
+    #[test]
+    fn test_sso_credentials_serde_round_trip() {
+        let creds = make_creds("2099-01-01T00:00:00Z");
+        let json = serde_json::to_string(&creds).unwrap();
+        let deser: SsoCredentials = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.expiresAt, creds.expiresAt);
+        assert_eq!(deser.region, creds.region);
+        assert_eq!(deser.startUrl, creds.startUrl);
+        assert_eq!(deser.accessToken, creds.accessToken);
+    }
+
+    #[test]
+    fn test_url_code_serde_round_trip() {
+        let uc = UrlCode {
+            device_code: "dev-code".to_string(),
+            url: "https://example.com".to_string(),
+        };
+        let json = serde_json::to_string(&uc).unwrap();
+        let deser: UrlCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.device_code, "dev-code");
+        assert_eq!(deser.url, "https://example.com");
+    }
+
+    // --- Default ---
+
+    #[test]
+    fn test_sso_credentials_default() {
+        let creds = SsoCredentials::default();
+        assert_eq!(creds.expiresAt, "");
+        assert_eq!(creds.region, "");
+        assert_eq!(creds.startUrl, "");
+        assert_eq!(creds.accessToken, "");
+    }
+
+    #[test]
+    fn test_url_code_default() {
+        let uc = UrlCode::default();
+        assert_eq!(uc.device_code, "");
+        assert_eq!(uc.url, "");
+    }
+
+    // --- MyErrors Display ---
+
+    #[test]
+    fn test_error_display_expiration_parser() {
+        assert_eq!(
+            format!("{}", MyErrors::ExpirationParser),
+            "Could not parse AWS expiration date!"
+        );
+    }
+
+    #[test]
+    fn test_error_display_get_role_credential() {
+        assert_eq!(
+            format!("{}", MyErrors::GetRoleCredentialError),
+            "Error getting credentials!"
+        );
+    }
+
+    #[test]
+    fn test_error_display_get_url() {
+        assert_eq!(format!("{}", MyErrors::GetUrlError), "Error getting URL!");
+    }
+
+    #[test]
+    fn test_error_display_credentials_from_url() {
+        assert_eq!(
+            format!("{}", MyErrors::CredentialsFromURLError),
+            "Error getting credentials with URL!"
+        );
+    }
+
+    // --- Proptest ---
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_expires_sign_matches_bool(offset in -168i64..168i64) {
+            let dt = Local::now().naive_local() + Duration::hours(offset);
+            let formatted = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            let creds = make_creds(&formatted);
+            if let Ok((dur, expired)) = creds.expires() {
+                // If expired is true, duration should be negative (or close to 0)
+                // If expired is false, duration should be positive (or close to 0)
+                if expired {
+                    prop_assert!(dur.num_seconds() <= 1);
+                } else {
+                    prop_assert!(dur.num_seconds() >= -1);
+                }
+            }
         }
     }
 }

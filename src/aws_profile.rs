@@ -405,3 +405,222 @@ impl std::fmt::Display for MyErrors {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sso_profile(name: &str, url: &str) -> SsoProfile {
+        SsoProfile {
+            profile_name: name.to_string(),
+            sso_start_url: url.to_string(),
+            sso_region: "us-west-2".to_string(),
+            sso_account_id: "123456789012".to_string(),
+            sso_role_name: "AdminRole".to_string(),
+            region: Some("us-west-2".to_string()),
+            duration_seconds: Some(3600),
+        }
+    }
+
+    fn make_assume_profile(name: &str) -> AssumeSsoProfile {
+        AssumeSsoProfile {
+            source_profile: "dev".to_string(),
+            profile_name: name.to_string(),
+            role_arn: "arn:aws:iam::123456789012:role/MyRole".to_string(),
+            region: "us-east-1".to_string(),
+        }
+    }
+
+    fn make_profiles() -> Profiles {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "dev".to_string(),
+            Profile::SsoProfile(make_sso_profile("dev", "https://my-sso.awsapps.com/start")),
+        );
+        profiles.insert(
+            "staging".to_string(),
+            Profile::SsoProfile(make_sso_profile(
+                "staging",
+                "https://other-sso.awsapps.com/start",
+            )),
+        );
+        profiles.insert(
+            "assume-prod".to_string(),
+            Profile::AssumeSsoProfile(make_assume_profile("assume-prod")),
+        );
+        Profiles { profiles }
+    }
+
+    // --- from_url() ---
+
+    #[test]
+    fn test_from_url_matching() {
+        let profiles = make_profiles();
+        let result = profiles.from_url("https://my-sso.awsapps.com/start");
+        assert!(result.is_some());
+        match result.unwrap() {
+            Profile::SsoProfile(p) => assert_eq!(p.profile_name, "dev"),
+            _ => panic!("expected SsoProfile"),
+        }
+    }
+
+    #[test]
+    fn test_from_url_unknown_returns_none() {
+        let profiles = make_profiles();
+        let result = profiles.from_url("https://unknown.awsapps.com/start");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_from_url_empty_profiles() {
+        let profiles = Profiles {
+            profiles: HashMap::new(),
+        };
+        assert!(profiles
+            .from_url("https://my-sso.awsapps.com/start")
+            .is_none());
+    }
+
+    #[test]
+    fn test_from_url_ignores_assume_profiles() {
+        // Create profiles with only an assume profile
+        let mut map = HashMap::new();
+        map.insert(
+            "assume-prod".to_string(),
+            Profile::AssumeSsoProfile(make_assume_profile("assume-prod")),
+        );
+        let profiles = Profiles { profiles: map };
+        assert!(profiles
+            .from_url("arn:aws:iam::123456789012:role/MyRole")
+            .is_none());
+    }
+
+    // --- Serde round-trips ---
+
+    #[test]
+    fn test_profiles_serde_round_trip() {
+        let profiles = make_profiles();
+        let json = serde_json::to_string(&profiles).unwrap();
+        let deser: Profiles = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.profiles.len(), profiles.profiles.len());
+    }
+
+    #[test]
+    fn test_sso_profile_serde_round_trip() {
+        let profile = make_sso_profile("dev", "https://my-sso.awsapps.com/start");
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: SsoProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.profile_name, "dev");
+        assert_eq!(deser.sso_start_url, "https://my-sso.awsapps.com/start");
+        assert_eq!(deser.sso_region, "us-west-2");
+        assert_eq!(deser.sso_account_id, "123456789012");
+        assert_eq!(deser.sso_role_name, "AdminRole");
+        assert_eq!(deser.region, Some("us-west-2".to_string()));
+        assert_eq!(deser.duration_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_assume_sso_profile_serde_round_trip() {
+        let profile = make_assume_profile("assume-prod");
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: AssumeSsoProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.profile_name, "assume-prod");
+        assert_eq!(deser.source_profile, "dev");
+        assert_eq!(deser.role_arn, "arn:aws:iam::123456789012:role/MyRole");
+        assert_eq!(deser.region, "us-east-1");
+    }
+
+    #[test]
+    fn test_profile_enum_sso_variant_serde() {
+        let profile = Profile::SsoProfile(make_sso_profile("test", "https://url"));
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: Profile = serde_json::from_str(&json).unwrap();
+        match deser {
+            Profile::SsoProfile(p) => assert_eq!(p.profile_name, "test"),
+            _ => panic!("expected SsoProfile"),
+        }
+    }
+
+    #[test]
+    fn test_profile_enum_assume_variant_serde() {
+        let profile = Profile::AssumeSsoProfile(make_assume_profile("ap"));
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: Profile = serde_json::from_str(&json).unwrap();
+        match deser {
+            Profile::AssumeSsoProfile(p) => assert_eq!(p.profile_name, "ap"),
+            _ => panic!("expected AssumeSsoProfile"),
+        }
+    }
+
+    #[test]
+    fn test_profile_enum_other_variant_serde() {
+        let profile = Profile::OtherProfile;
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: Profile = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deser, Profile::OtherProfile));
+    }
+
+    // --- Optional fields ---
+
+    #[test]
+    fn test_sso_profile_optional_region_none() {
+        let mut profile = make_sso_profile("test", "https://url");
+        profile.region = None;
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: SsoProfile = serde_json::from_str(&json).unwrap();
+        assert!(deser.region.is_none());
+    }
+
+    #[test]
+    fn test_sso_profile_optional_duration_none() {
+        let mut profile = make_sso_profile("test", "https://url");
+        profile.duration_seconds = None;
+        let json = serde_json::to_string(&profile).unwrap();
+        let deser: SsoProfile = serde_json::from_str(&json).unwrap();
+        assert!(deser.duration_seconds.is_none());
+    }
+
+    // --- Default ---
+
+    #[test]
+    fn test_profiles_default() {
+        let p = Profiles::default();
+        assert!(p.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_sso_profile_default() {
+        let p = SsoProfile::default();
+        assert_eq!(p.profile_name, "");
+        assert_eq!(p.sso_start_url, "");
+        assert!(p.region.is_none());
+        assert!(p.duration_seconds.is_none());
+    }
+
+    #[test]
+    fn test_assume_sso_profile_default() {
+        let p = AssumeSsoProfile::default();
+        assert_eq!(p.source_profile, "");
+        assert_eq!(p.profile_name, "");
+        assert_eq!(p.role_arn, "");
+        assert_eq!(p.region, "");
+    }
+
+    // --- MyErrors Display ---
+
+    #[test]
+    fn test_error_display_profile_not_found() {
+        assert_eq!(
+            format!("{}", MyErrors::ProfileFileNotFound),
+            "Could not find aws config file"
+        );
+    }
+
+    #[test]
+    fn test_error_display_exe_path() {
+        assert_eq!(
+            format!("{}", MyErrors::ExePathError),
+            "Could not get exe path"
+        );
+    }
+}
