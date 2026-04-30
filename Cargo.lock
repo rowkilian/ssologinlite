@@ -2038,6 +2038,7 @@ dependencies = [
  "serde_json",
  "sha1_smol",
  "sha2",
+ "tempfile",
  "time",
  "tokio",
  "url-search-params",

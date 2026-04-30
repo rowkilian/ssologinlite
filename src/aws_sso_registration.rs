@@ -109,7 +109,7 @@ impl SsoRegistration {
         let res = SsoRegistration {
             clientSecret: client_secret,
             clientId: client_id,
-            expiresAt: datetime.to_rfc3339(),
+            expiresAt: datetime.format("%Y-%m-%dT%H:%M:%S+00:00").to_string(),
         };
         cache_sso_registration(&res).await?;
         Ok(res)
@@ -129,5 +129,127 @@ impl std::fmt::Display for MyErrors {
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::RegisterClientError => write!(f, "Error registering client!"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_reg(expires_at: &str) -> SsoRegistration {
+        SsoRegistration {
+            clientSecret: "secret-123".to_string(),
+            clientId: "client-456".to_string(),
+            expiresAt: expires_at.to_string(),
+        }
+    }
+
+    // --- is_expired() ---
+
+    #[test]
+    fn test_is_expired_future_rfc3339() {
+        // is_expired() parses with "%Y-%m-%dT%H:%M:%S%z" — no fractional seconds
+        let future = (Utc::now() + chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        let reg = make_reg(&future);
+        assert!(!reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_past_rfc3339() {
+        let past = (Utc::now() - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        let reg = make_reg(&past);
+        assert!(reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_invalid_format() {
+        let reg = make_reg("not-a-date");
+        assert!(reg.is_expired());
+    }
+
+    #[test]
+    fn test_is_expired_empty_string() {
+        let reg = make_reg("");
+        assert!(reg.is_expired());
+    }
+
+    // --- Regression: register_client() format must be parseable by is_expired() ---
+
+    #[test]
+    fn test_register_client_format_parseable_by_is_expired() {
+        // register_client() now stores "%Y-%m-%dT%H:%M:%S+00:00" (no nanoseconds)
+        // which is_expired() can parse with "%Y-%m-%dT%H:%M:%S%z"
+        let future = (Utc::now() + chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        let reg = make_reg(&future);
+        assert!(
+            !reg.is_expired(),
+            "Future date should not be expired: {}",
+            future
+        );
+    }
+
+    // --- Serde ---
+
+    #[test]
+    fn test_sso_registration_serde_round_trip() {
+        let reg = make_reg("2099-01-01T00:00:00+00:00");
+        let json = serde_json::to_string(&reg).unwrap();
+        let deser: SsoRegistration = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.clientSecret, reg.clientSecret);
+        assert_eq!(deser.clientId, reg.clientId);
+        assert_eq!(deser.expiresAt, reg.expiresAt);
+    }
+
+    #[test]
+    fn test_sso_registration_deserialize_from_json() {
+        let json = r#"{"clientSecret":"s","clientId":"c","expiresAt":"2099-01-01T00:00:00+00:00"}"#;
+        let reg: SsoRegistration = serde_json::from_str(json).unwrap();
+        assert_eq!(reg.clientSecret, "s");
+        assert_eq!(reg.clientId, "c");
+    }
+
+    // --- Default ---
+
+    #[test]
+    fn test_sso_registration_default() {
+        let reg = SsoRegistration::default();
+        assert_eq!(reg.clientSecret, "");
+        assert_eq!(reg.clientId, "");
+        assert_eq!(reg.expiresAt, "");
+    }
+
+    // --- Clone ---
+
+    #[test]
+    fn test_sso_registration_clone() {
+        let reg = make_reg("2099-01-01T00:00:00+00:00");
+        let cloned = reg.clone();
+        assert_eq!(cloned.clientSecret, reg.clientSecret);
+        assert_eq!(cloned.clientId, reg.clientId);
+        assert_eq!(cloned.expiresAt, reg.expiresAt);
+    }
+
+    // --- MyErrors Display ---
+
+    #[test]
+    fn test_error_display_get_role_credential() {
+        assert_eq!(
+            format!("{}", MyErrors::GetRoleCredentialError),
+            "Error getting credentials!"
+        );
+    }
+
+    #[test]
+    fn test_error_display_register_client() {
+        assert_eq!(
+            format!("{}", MyErrors::RegisterClientError),
+            "Error registering client!"
+        );
     }
 }

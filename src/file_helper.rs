@@ -95,3 +95,109 @@ impl std::fmt::Display for MyErrors {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    // --- get_home_os_string() ---
+
+    #[test]
+    fn test_get_home_os_string_returns_ok() {
+        let result = get_home_os_string(".aws/config");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_home_os_string_contains_segments() {
+        let result = get_home_os_string(".aws/config").unwrap();
+        let path = Path::new(&result);
+        assert!(path.ends_with(".aws/config"));
+    }
+
+    #[test]
+    fn test_get_home_os_string_starts_with_home() {
+        let result = get_home_os_string("test/file").unwrap();
+        let home = home_dir().unwrap();
+        let path = Path::new(&result);
+        assert!(path.starts_with(&home));
+    }
+
+    // --- get_aws_config() ---
+
+    #[test]
+    fn test_get_aws_config_returns_ok() {
+        let result = get_aws_config();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_aws_config_ends_with_aws_config() {
+        let result = get_aws_config().unwrap();
+        let path = Path::new(&result);
+        assert!(path.ends_with(".aws/config"));
+    }
+
+    // --- get_exe_path() ---
+
+    #[test]
+    fn test_get_exe_path_returns_ok() {
+        let result = get_exe_path();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_exe_path_non_empty() {
+        let result = get_exe_path().unwrap();
+        assert!(!result.is_empty());
+    }
+
+    // --- get_relative_os_string() ---
+
+    #[test]
+    fn test_get_relative_os_string_returns_ok() {
+        let result = get_relative_os_string("some/path");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_relative_os_string_ends_with_input() {
+        let result = get_relative_os_string("some/path").unwrap();
+        let path = Path::new(&result);
+        assert!(path.ends_with("some/path"));
+    }
+
+    // --- restrict_file_permissions() ---
+
+    #[test]
+    fn test_restrict_file_permissions_sets_600() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = OsString::from(tmp.path().as_os_str());
+        restrict_file_permissions(&path).unwrap();
+        let meta = metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_restrict_file_permissions_nonexistent_errors() {
+        let path = OsString::from("/tmp/nonexistent_file_ssologinlite_test_12345");
+        assert!(restrict_file_permissions(&path).is_err());
+    }
+
+    // --- MyErrors Display ---
+
+    #[test]
+    fn test_error_display_current_exe() {
+        assert_eq!(
+            format!("{}", MyErrors::CurrentExe),
+            "Current exe not working!"
+        );
+    }
+
+    #[test]
+    fn test_error_display_path() {
+        assert_eq!(format!("{}", MyErrors::Path), "Can not find Path");
+    }
+}
