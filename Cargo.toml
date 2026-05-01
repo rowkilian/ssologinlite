@@ -50,7 +50,6 @@ serial_test = "3"
 
 [profile.release]
 strip = 'symbols'
-# opt-level = "s"
 lto = true
 codegen-units = 1
 panic = 'abort'

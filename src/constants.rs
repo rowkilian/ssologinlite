@@ -1,5 +1,4 @@
 pub const CREDS_CACHE: &str = ".ssologinlite_cache";
-pub const CONF_CACHE: &str = ".conf_cache";
 pub const PROGRAM_FOLDER: &str = ".aws/ssologinlite";
 pub const PROGRAM_NAME: &str = "ssologinlite";
 pub const PROFILES: &str = "profiles.json";
@@ -13,11 +12,6 @@ mod tests {
     #[test]
     fn test_creds_cache() {
         assert_eq!(CREDS_CACHE, ".ssologinlite_cache");
-    }
-
-    #[test]
-    fn test_conf_cache() {
-        assert_eq!(CONF_CACHE, ".conf_cache");
     }
 
     #[test]

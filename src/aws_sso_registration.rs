@@ -19,19 +19,19 @@ pub struct SsoRegistration {
 }
 
 impl SsoRegistration {
-    pub async fn get() -> Result<SsoRegistration> {
+    pub async fn get(sso_region: &str) -> Result<SsoRegistration> {
         match SsoRegistration::from_cache().await {
             Some(reg) => {
                 if reg.is_expired() {
                     info!("SSO registration is expired. Registering new client.");
-                    SsoRegistration::register_client().await
+                    SsoRegistration::register_client(sso_region).await
                 } else {
                     Ok(reg)
                 }
             }
             None => {
                 info!("No SSO registration found. Registering new client.");
-                SsoRegistration::register_client().await
+                SsoRegistration::register_client(sso_region).await
             }
         }
     }
@@ -41,10 +41,12 @@ impl SsoRegistration {
     }
 
     pub fn is_expired(&self) -> bool {
-        // parse_from_rfc3339 accepts every valid RFC3339 timestamp (with or
-        // without fractional seconds, with `Z` or `+HH:MM` offset) and is
-        // timezone-aware, so comparing against Utc::now() is correct in any
-        // local timezone.
+        // register_client writes expiresAt via DateTime<Utc>::to_rfc3339(), which
+        // produces "2026-04-30T12:34:56.123456789+00:00" — fractional seconds + a
+        // colon-form offset. The previous NaiveDateTime + "%z" parser rejected
+        // both. parse_from_rfc3339 accepts every valid RFC3339 timestamp and is
+        // timezone-aware, so comparing against Utc::now() is correct in any local
+        // timezone.
         let exp_dt = match DateTime::parse_from_rfc3339(&self.expiresAt) {
             Ok(expiration) => expiration.with_timezone(&Utc),
             Err(e) => {
@@ -59,9 +61,8 @@ impl SsoRegistration {
         now > exp_dt
     }
 
-    pub async fn register_client() -> Result<SsoRegistration> {
-        let sso_region = "us-west-2";
-        let sdkregion = sdkRegion::new(sso_region);
+    pub async fn register_client(sso_region: &str) -> Result<SsoRegistration> {
+        let sdkregion = sdkRegion::new(sso_region.to_string());
 
         let config = aws_sdk_ssooidc::Config::builder()
             .region(sdkregion)
@@ -99,7 +100,6 @@ impl SsoRegistration {
             }
         };
         let timestamp = output.client_secret_expires_at;
-        // let naive = NaiveDateTime::from_timestamp(timestamp, 0);
         let datetime: DateTime<Utc> = match DateTime::from_timestamp(timestamp, 0) {
             Some(dt) => dt,
             None => {
@@ -107,7 +107,6 @@ impl SsoRegistration {
             }
         };
 
-        // self.registrationExpiresAt = datetime.to_rfc3339();
         let res = SsoRegistration {
             clientSecret: client_secret,
             clientId: client_id,

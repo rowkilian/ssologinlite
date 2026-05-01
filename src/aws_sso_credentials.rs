@@ -10,9 +10,7 @@ use aws_types::region::Region as sdkRegion;
 use chrono::{Duration, Local, NaiveDateTime};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
-use std::thread;
-use std::time::Duration as StdDuration;
-// use webbrowser::{open_browser, Browser};
+use std::time::{Duration as StdDuration, Instant};
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[allow(non_snake_case)]
@@ -27,6 +25,11 @@ pub struct SsoCredentials {
 pub struct UrlCode {
     pub device_code: String,
     pub url: String,
+    // Lifetime of the device_code in seconds, as returned by AWS OIDC
+    // StartDeviceAuthorization. Polling beyond this is guaranteed to fail.
+    pub expires_in: i32,
+    // AWS-recommended polling interval in seconds.
+    pub interval: i32,
 }
 
 impl SsoCredentials {
@@ -67,48 +70,73 @@ impl SsoCredentials {
     }
 
     async fn refresh(profile: SsoProfile) -> Result<SsoCredentials> {
-        // let registration = SsoRegistration::get().await?;
         info!(
             "refresh (calling AWS api) SsoCredentials for {}",
             profile.profile_name
         );
         let conf = ProgramConfig::new()?;
-        // open_url(conf, url);
         debug!("getting login url from AWS");
-        let res_url = SsoCredentials::login_url_from_aws(profile.clone()).await;
-        let device_code = match res_url.as_ref() {
-            Ok(code) => code.clone().device_code,
-            Err(e) => {
+        let url_code = SsoCredentials::login_url_from_aws(profile.clone())
+            .await
+            .map_err(|e| {
                 error!("aws_sso_credentials.SsoCredentials.refresh {}", e);
-                return Err(anyhow!(MyErrors::GetUrlError));
-            }
-        };
-        let url_as_str = match res_url {
-            Ok(code) => code.url,
-            Err(e) => {
-                error!("aws_sso_credentials.SsoCredentials.refresh {}", e);
-                return Err(anyhow!(MyErrors::GetUrlError));
-            }
-        };
-        debug!("opening browser with url: {}", url_as_str);
-        if open_url(conf, url_as_str.clone()).is_ok() {
-            loop {
-                debug!("wating 1 second");
-                thread::sleep(StdDuration::from_millis(1000));
-                match SsoCredentials::create_token(profile.clone(), device_code.clone()).await {
-                    Ok(creds) => {
-                        debug!("url {} validated.", url_as_str);
-                        return Ok(creds);
-                    }
-                    _ => {
-                        debug!("url not validated yet.");
+                anyhow!(MyErrors::GetUrlError)
+            })?;
+
+        // AWS returns a device_code with a fixed lifetime (typically ~10 minutes)
+        // and a recommended polling interval. Bound the loop with these values
+        // so a user who closes the browser tab doesn't leave us spinning forever.
+        // .max(1) guards against zero/negative values from unexpected API responses.
+        let expires_in_secs = url_code.expires_in.max(1) as u64;
+        let interval_secs = url_code.interval.max(1) as u64;
+        let device_code = url_code.device_code;
+        let url_as_str = url_code.url;
+
+        // The verification URL embeds the user_code; logging it would let
+        // anyone with read access to the log complete the SSO authorization
+        // as the user. Log a benign message instead.
+        debug!("opening browser to complete SSO authorization");
+        open_url(conf, url_as_str.clone()).map_err(|e| {
+            error!("aws_sso_credentials.SsoCredentials.refresh open_url: {}", e);
+            anyhow!(MyErrors::GetUrlError)
+        })?;
+
+        let deadline = Instant::now() + StdDuration::from_secs(expires_in_secs);
+        while Instant::now() < deadline {
+            tokio::time::sleep(StdDuration::from_secs(interval_secs)).await;
+            match SsoCredentials::create_token(profile.clone(), device_code.clone()).await {
+                Ok(creds) => {
+                    debug!("device-code authorization completed");
+                    return Ok(creds);
+                }
+                Err(e) => {
+                    // create_token uses MyErrors::AuthorizationPending for the
+                    // expected "not-yet-authorized" / "slow down" responses;
+                    // anything else (invalid client/grant, expired device code,
+                    // access denied, network error) is fatal and we surface it
+                    // immediately rather than burning the rest of the deadline
+                    // on a permanent failure.
+                    let pending = e
+                        .downcast_ref::<MyErrors>()
+                        .map(|me| matches!(me, MyErrors::AuthorizationPending))
+                        .unwrap_or(false);
+                    if pending {
+                        debug!("device-code not yet authorized; continuing to poll");
                         continue;
                     }
+                    error!(
+                        "aws_sso_credentials.SsoCredentials.refresh: fatal error during polling: {}",
+                        e
+                    );
+                    return Err(e);
                 }
             }
         }
-
-        Err(anyhow!(MyErrors::ExpirationParser))
+        Err(anyhow!(
+            "SSO device-code authorization timed out after {} seconds; \
+             the browser flow was not completed in time",
+            expires_in_secs
+        ))
     }
 
     pub async fn login_url_from_aws(profile: SsoProfile) -> Result<UrlCode> {
@@ -127,7 +155,7 @@ impl SsoCredentials {
             .build();
 
         let client = aws_sdk_ssooidc::Client::from_conf(config);
-        let registration = SsoRegistration::get().await?;
+        let registration = SsoRegistration::get(&profile.sso_region).await?;
         let output = match client
             .start_device_authorization()
             .set_client_id(Some(registration.clientId.to_owned()))
@@ -165,12 +193,14 @@ impl SsoCredentials {
         Ok(UrlCode {
             url: res_url,
             device_code: res_device_code,
+            expires_in: output.expires_in,
+            interval: output.interval,
         })
     }
 
     pub async fn create_token(profile: SsoProfile, device_code: String) -> Result<SsoCredentials> {
         info!("getting token from AWS");
-        let registration = SsoRegistration::get().await?;
+        let registration = SsoRegistration::get(&profile.sso_region).await?;
         let sdkregion = sdkRegion::new(profile.sso_region.clone());
         let provider = Builder::new()
             .region(sdkregion.clone())
@@ -199,6 +229,26 @@ impl SsoCredentials {
         {
             Ok(output) => output,
             Err(e) => {
+                // The polling loop in refresh() distinguishes "not yet
+                // authorized" / "slow down" from fatal errors; tag the
+                // expected polling responses with AuthorizationPending so
+                // the caller can keep waiting, and fail fast on everything
+                // else (invalid client/grant, expired device code, access
+                // denied, network errors).
+                use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
+                if matches!(
+                    e.as_service_error(),
+                    Some(
+                        CreateTokenError::AuthorizationPendingException(_)
+                            | CreateTokenError::SlowDownException(_)
+                    )
+                ) {
+                    debug!(
+                        "aws_sso_credentials.SsoCredentials.create_token (pending): {}",
+                        e
+                    );
+                    return Err(anyhow!(MyErrors::AuthorizationPending));
+                }
                 error!("aws_sso_credentials.SsoCredentials.create_token {}", e);
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
             }
@@ -228,7 +278,6 @@ impl SsoCredentials {
     pub fn expires(&self) -> Result<(chrono::Duration, bool)> {
         info!("checking token expiration");
         let now = Local::now().naive_local();
-        // let st_exp: &str = &self.expiresAt[..];
         let pre_exp = &self.expiresAt;
         let exp_dt = match NaiveDateTime::parse_from_str(&pre_exp[..], "%Y-%m-%dT%H:%M:%SZ") {
             Ok(expiration) => expiration,
@@ -260,6 +309,10 @@ enum MyErrors {
     GetRoleCredentialError,
     GetUrlError,
     CredentialsFromURLError,
+    // Tags create_token's expected polling responses (AuthorizationPending /
+    // SlowDown) so the refresh() loop can distinguish "keep waiting" from
+    // a fatal SDK error and fail fast on the latter.
+    AuthorizationPending,
 }
 
 impl std::fmt::Display for MyErrors {
@@ -269,6 +322,9 @@ impl std::fmt::Display for MyErrors {
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::GetUrlError => write!(f, "Error getting URL!"),
             Self::CredentialsFromURLError => write!(f, "Error getting credentials with URL!"),
+            Self::AuthorizationPending => {
+                write!(f, "device-code authorization is still pending")
+            }
         }
     }
 }
@@ -374,11 +430,15 @@ mod tests {
         let uc = UrlCode {
             device_code: "dev-code".to_string(),
             url: "https://example.com".to_string(),
+            expires_in: 600,
+            interval: 1,
         };
         let json = serde_json::to_string(&uc).unwrap();
         let deser: UrlCode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.device_code, "dev-code");
         assert_eq!(deser.url, "https://example.com");
+        assert_eq!(deser.expires_in, 600);
+        assert_eq!(deser.interval, 1);
     }
 
     // --- Default ---
