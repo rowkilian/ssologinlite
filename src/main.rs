@@ -9,6 +9,7 @@ use ssologinlite::config::ProgramConfig;
 use ssologinlite::eks::EksToken;
 use ssologinlite::logger::logger;
 use ssologinlite::parser::{Cli, Commands};
+use ssologinlite::tui;
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -107,6 +108,9 @@ async fn main() -> Result<ExitCode> {
             };
             print!("{}", sso_expiration);
         }
+        Commands::Tui => {
+            tui::run()?;
+        }
         Commands::SSOExpiresSoon => {
             let conf = ProgramConfig::new()?;
             let credentials = match conf.default_sso_url {
@@ -130,8 +134,10 @@ async fn main() -> Result<ExitCode> {
     Ok(ExitCode::from(0))
 }
 
-// Custom error enum
+// Custom error enum. The shared "Error" suffix is intentional and matches
+// the pattern used by sibling modules' MyErrors enums.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 enum MyErrors {
     RegionNotFoundError,
     ProfileNotFoundError,
