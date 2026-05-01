@@ -14,8 +14,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use std::io::{self, Stdout};
-use std::process::Command;
+use std::io::{self, BufRead, BufReader, Stdout};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use crate::aws_profile::{AssumeSsoProfile, Profile, Profiles, SsoProfile};
 use crate::constants::{PROFILES, PROGRAM_FOLDER};
@@ -287,11 +290,27 @@ enum Screen {
     List,
     Detail,
     Add,
-    TestResult {
-        success: bool,
-        output: String,
-        profile_name: String,
-    },
+    Test(TestRun),
+}
+
+// Output from the spawned `aws sts get-caller-identity` subprocess. Reader
+// threads forward each line over a channel; the main loop drains the channel
+// each frame and appends to TestRun.output so the user sees streaming output
+// inside the TUI.
+enum TestEvent {
+    Stdout(String),
+    Stderr(String),
+}
+
+struct TestRun {
+    profile_name: String,
+    output: String,
+    finished: Option<bool>,
+    rx: mpsc::Receiver<TestEvent>,
+    // Held so we can poll exit status with try_wait() and kill on cancel.
+    // Cleared once the child has exited.
+    child: Option<Child>,
+    started_at: std::time::Instant,
 }
 
 struct App {
@@ -355,7 +374,7 @@ impl App {
         self.profiles.profiles.get(name)
     }
 
-    fn handle_key(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+    fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if key.kind != KeyEventKind::Press {
             return Ok(false);
         }
@@ -368,14 +387,14 @@ impl App {
             self.status = None;
         }
         match self.screen {
-            Screen::List => self.handle_list(key, terminal),
-            Screen::Detail => self.handle_detail(key, terminal),
+            Screen::List => self.handle_list(key),
+            Screen::Detail => self.handle_detail(key),
             Screen::Add => self.handle_add(key),
-            Screen::TestResult { .. } => self.handle_test(key),
+            Screen::Test(_) => self.handle_test(key),
         }
     }
 
-    fn handle_list(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+    fn handle_list(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -408,7 +427,7 @@ impl App {
             }
             KeyCode::Char('t') => {
                 if let Some(name) = self.selected_name() {
-                    self.run_test(&name, terminal)?;
+                    self.run_test(&name);
                 }
             }
             _ => {}
@@ -416,13 +435,13 @@ impl App {
         Ok(false)
     }
 
-    fn handle_detail(&mut self, key: KeyEvent, terminal: &mut Term) -> Result<bool> {
+    fn handle_detail(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Esc => self.screen = Screen::List,
             KeyCode::Char('t') => {
                 if let Some(name) = self.selected_name() {
-                    self.run_test(&name, terminal)?;
+                    self.run_test(&name);
                 }
             }
             _ => {}
@@ -488,12 +507,55 @@ impl App {
     }
 
     fn handle_test(&mut self, key: KeyEvent) -> Result<bool> {
+        let running = matches!(&self.screen, Screen::Test(r) if r.finished.is_none());
         match key.code {
-            KeyCode::Char('q') => return Ok(true),
-            KeyCode::Esc | KeyCode::Enter => self.screen = Screen::List,
+            KeyCode::Char('q') if !running => return Ok(true),
+            KeyCode::Esc => {
+                // While the subprocess is still running, kill it before
+                // navigating away. Reader threads will exit naturally as the
+                // pipes close.
+                if let Screen::Test(run) = &mut self.screen {
+                    if let Some(child) = run.child.as_mut() {
+                        let _ = child.kill();
+                    }
+                }
+                self.screen = Screen::List;
+            }
+            KeyCode::Enter if !running => self.screen = Screen::List,
             _ => {}
         }
         Ok(false)
+    }
+
+    // Drain any subprocess output produced since the last frame and check
+    // whether the child has exited. Called from the main loop on every tick
+    // when a test is running so the output panel updates in real time.
+    fn poll_test(&mut self) -> Result<()> {
+        let Screen::Test(run) = &mut self.screen else {
+            return Ok(());
+        };
+        if run.finished.is_some() {
+            return Ok(());
+        }
+        while let Ok(ev) = run.rx.try_recv() {
+            match ev {
+                TestEvent::Stdout(line) | TestEvent::Stderr(line) => {
+                    run.output.push_str(&line);
+                    run.output.push('\n');
+                }
+            }
+        }
+        if let Some(child) = run.child.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                run.finished = Some(status.success());
+                run.child = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_test_running(&self) -> bool {
+        matches!(&self.screen, Screen::Test(r) if r.finished.is_none())
     }
 
     fn save_form(&mut self) -> Result<String> {
@@ -521,38 +583,78 @@ impl App {
         Ok(name)
     }
 
-    fn run_test(&mut self, profile_name: &str, terminal: &mut Term) -> Result<()> {
-        // Suspend the alt screen so a possible interactive SSO browser flow,
-        // and any output produced by the AWS CLI, render normally on the user's
-        // terminal. We resume the TUI afterwards and show the captured output.
-        suspend_tui(terminal)?;
-        println!("running: aws sts get-caller-identity --profile {profile_name}");
-        println!("(if SSO login is required, complete it in the browser)\n");
-        let outcome = Command::new("aws")
-            .args(["sts", "get-caller-identity", "--profile", profile_name])
-            .output();
-        let (success, output_str) = match outcome {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-                let success = o.status.success();
-                let combined = if success {
-                    stdout
-                } else {
-                    format!("STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
-                };
-                (success, combined)
+    // Spawn `aws sts get-caller-identity --profile <name>` with piped stdio
+    // and stream its output into a TUI pane (Screen::Test). Reader threads
+    // forward each stdout/stderr line over a channel; the main loop drains
+    // the channel each tick via poll_test() so the user sees output appear
+    // live without dropping back to the shell.
+    fn run_test(&mut self, profile_name: &str) {
+        let run = match spawn_test(profile_name) {
+            Ok(run) => run,
+            Err(e) => {
+                // The spawn itself failed (e.g. `aws` not on PATH). Show
+                // a one-shot finished TestRun so the user sees the error.
+                let (_dummy_tx, rx) = mpsc::channel();
+                TestRun {
+                    profile_name: profile_name.to_string(),
+                    output: format!("failed to launch `aws` CLI: {e}\n"),
+                    finished: Some(false),
+                    rx,
+                    child: None,
+                    started_at: std::time::Instant::now(),
+                }
             }
-            Err(e) => (false, format!("failed to launch `aws` CLI: {e}")),
         };
-        resume_tui(terminal)?;
-        self.screen = Screen::TestResult {
-            success,
-            output: output_str,
-            profile_name: profile_name.to_string(),
-        };
-        Ok(())
+        self.screen = Screen::Test(run);
     }
+}
+
+fn spawn_test(profile_name: &str) -> Result<TestRun> {
+    let mut child = Command::new("aws")
+        .args(["sts", "get-caller-identity", "--profile", profile_name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture stderr"))?;
+
+    let (tx, rx) = mpsc::channel();
+
+    // Reader threads end naturally when the pipes close (i.e. when the child
+    // exits). They take ownership of the pipe so we don't need to join.
+    let tx_out = tx.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx_out.send(TestEvent::Stdout(line)).is_err() {
+                break;
+            }
+        }
+    });
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send(TestEvent::Stderr(line)).is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(TestRun {
+        profile_name: profile_name.to_string(),
+        output: String::new(),
+        finished: None,
+        rx,
+        child: Some(child),
+        started_at: std::time::Instant::now(),
+    })
 }
 
 // === Rendering ===
@@ -562,11 +664,7 @@ fn render(app: &mut App, f: &mut Frame) {
         Screen::List => render_list(app, f),
         Screen::Detail => render_detail(app, f),
         Screen::Add => render_add(app, f),
-        Screen::TestResult {
-            success,
-            output,
-            profile_name,
-        } => render_test(*success, output, profile_name, f),
+        Screen::Test(run) => render_test(run, f),
     }
 }
 
@@ -775,7 +873,7 @@ fn render_add(app: &mut App, f: &mut Frame) {
     );
 }
 
-fn render_test(success: bool, output: &str, profile_name: &str, f: &mut Frame) {
+fn render_test(run: &TestRun, f: &mut Frame) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
@@ -787,8 +885,30 @@ fn render_test(success: bool, output: &str, profile_name: &str, f: &mut Frame) {
             .as_ref(),
         )
         .split(f.area());
-    let header = if success {
-        Line::from(vec![
+
+    // Header reflects the running / done state. While the subprocess is
+    // alive we show a simple animated marker and the elapsed time so the
+    // user can tell the TUI hasn't frozen during a long SSO browser flow.
+    let header = match run.finished {
+        None => {
+            let frames = ["◐", "◓", "◑", "◒"];
+            let tick = run.started_at.elapsed().as_millis() / 200;
+            let spinner = frames[(tick as usize) % frames.len()];
+            let elapsed_secs = run.started_at.elapsed().as_secs();
+            Line::from(vec![
+                Span::styled(
+                    format!("{spinner} "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "running aws sts get-caller-identity --profile {} ({elapsed_secs}s)",
+                    run.profile_name
+                )),
+            ])
+        }
+        Some(true) => Line::from(vec![
             Span::styled(
                 "✓ ",
                 Style::default()
@@ -796,37 +916,51 @@ fn render_test(success: bool, output: &str, profile_name: &str, f: &mut Frame) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "aws sts get-caller-identity --profile {profile_name} succeeded"
+                "aws sts get-caller-identity --profile {} succeeded",
+                run.profile_name
             )),
-        ])
-    } else {
-        Line::from(vec![
+        ]),
+        Some(false) => Line::from(vec![
             Span::styled(
                 "✗ ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "aws sts get-caller-identity --profile {profile_name} failed"
+                "aws sts get-caller-identity --profile {} failed",
+                run.profile_name
             )),
-        ])
+        ]),
+    };
+
+    let title = match run.finished {
+        None => " test (running) ",
+        Some(_) => " test result ",
     };
     f.render_widget(
-        Paragraph::new(header).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" test result "),
-        ),
+        Paragraph::new(header).block(Block::default().borders(Borders::ALL).title(title)),
         chunks[0],
     );
+
+    let body_text = if run.output.is_empty() && run.finished.is_none() {
+        "(no output yet — waiting for the AWS CLI)\n\
+         If SSO login is required, the browser flow will be triggered by the credential_process.\n"
+            .to_string()
+    } else {
+        run.output.clone()
+    };
     f.render_widget(
-        Paragraph::new(output)
+        Paragraph::new(body_text)
             .block(Block::default().borders(Borders::ALL).title(" output "))
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+
+    let help_text = match run.finished {
+        None => "[Esc] cancel and back",
+        Some(_) => "[Esc / Enter] back  [q] quit",
+    };
     f.render_widget(
-        Paragraph::new("[Esc / Enter] back  [q] quit")
-            .block(Block::default().borders(Borders::ALL).title(" help ")),
+        Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title(" help ")),
         chunks[2],
     );
 }
@@ -930,28 +1064,6 @@ fn teardown_tui(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-fn suspend_tui(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
-}
-
-fn resume_tui(terminal: &mut Term) -> Result<()> {
-    enable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        EnableMouseCapture
-    )?;
-    terminal.clear()?;
-    Ok(())
-}
-
 pub fn run() -> Result<()> {
     let mut terminal = setup_tui()?;
     let mut app = App::new();
@@ -963,9 +1075,23 @@ pub fn run() -> Result<()> {
 fn run_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
     loop {
         terminal.draw(|f| render(app, f))?;
-        if let Event::Key(key) = event::read()? {
-            if app.handle_key(key, terminal)? {
-                break;
+        // Drain subprocess output produced since the last draw before we
+        // block on the keyboard, so the user sees test output between
+        // keystrokes too.
+        app.poll_test()?;
+        // While a test is running we want frequent ticks (output streaming
+        // and the spinner). Otherwise block for longer to keep CPU at 0
+        // when the user is reading the screen.
+        let timeout = if app.is_test_running() {
+            Duration::from_millis(80)
+        } else {
+            Duration::from_secs(60)
+        };
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if app.handle_key(key)? {
+                    break;
+                }
             }
         }
     }
