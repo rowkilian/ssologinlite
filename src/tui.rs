@@ -91,7 +91,24 @@ impl NewProfile {
 // must already exist in profiles.json.
 const ASSUME_SOURCE_FIELD: usize = 1;
 
+#[derive(Clone)]
+enum FormMode {
+    Add,
+    // original_name is the profile's key in profiles.json at the moment the
+    // edit form was opened. It can differ from the form's current "Profile
+    // name" field if the user is renaming, in which case save_form removes
+    // the old entry from profiles.json and ~/.aws/config.
+    Edit { original_name: String },
+}
+
+impl FormMode {
+    fn is_edit(&self) -> bool {
+        matches!(self, FormMode::Edit { .. })
+    }
+}
+
 struct AddForm {
+    mode: FormMode,
     kind: ProfileKind,
     sso_values: [String; 7],
     assume_values: [String; 4],
@@ -106,12 +123,60 @@ impl AddForm {
             assume_values[ASSUME_SOURCE_FIELD] = first.clone();
         }
         AddForm {
+            mode: FormMode::Add,
             kind: ProfileKind::Sso,
             sso_values: Default::default(),
             assume_values,
             focused: 0,
             available_sources,
         }
+    }
+
+    // Build a pre-populated form from an existing profile. Returns None for
+    // OtherProfile because we have no fields to edit on that variant.
+    fn new_for_edit(
+        profile: &Profile,
+        original_name: &str,
+        available_sources: Vec<String>,
+    ) -> Option<Self> {
+        let (kind, sso_values, assume_values) = match profile {
+            Profile::SsoProfile(p) => {
+                let values: [String; 7] = [
+                    p.profile_name.clone(),
+                    p.sso_start_url.clone(),
+                    p.sso_region.clone(),
+                    p.sso_account_id.clone(),
+                    p.sso_role_name.clone(),
+                    p.region.clone().unwrap_or_default(),
+                    p.duration_seconds
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
+                ];
+                (ProfileKind::Sso, values, Default::default())
+            }
+            Profile::AssumeSsoProfile(p) => {
+                let values: [String; 4] = [
+                    p.profile_name.clone(),
+                    p.source_profile.clone(),
+                    p.role_arn.clone(),
+                    p.region.clone(),
+                ];
+                (ProfileKind::AssumeSso, Default::default(), values)
+            }
+            Profile::OtherProfile => return None,
+        };
+        Some(AddForm {
+            mode: FormMode::Edit {
+                original_name: original_name.to_string(),
+            },
+            kind,
+            sso_values,
+            assume_values,
+            // Skip past the (locked) type slot and land on the first editable
+            // field so the user can start typing immediately.
+            focused: 1,
+            available_sources,
+        })
     }
 
     fn field_labels(&self) -> &'static [&'static str] {
@@ -186,6 +251,12 @@ impl AddForm {
     }
 
     fn toggle_kind(&mut self) {
+        // Switching type on an existing profile would change the field set
+        // out from under the user and the on-disk record — disallow it. To
+        // change type, delete and re-add.
+        if self.mode.is_edit() {
+            return;
+        }
         self.kind = self.kind.toggle();
         // Stay parked on the type slot after a toggle so the user sees the
         // change before stepping into the now-different field list.
@@ -421,6 +492,9 @@ impl App {
                 self.status = None;
                 self.screen = Screen::Add;
             }
+            KeyCode::Char('e') => {
+                self.start_edit_selected();
+            }
             KeyCode::Char('r') => {
                 self.refresh();
                 self.status = Some(("refreshed".to_string(), false));
@@ -444,9 +518,42 @@ impl App {
                     self.run_test(&name);
                 }
             }
+            KeyCode::Char('e') => {
+                self.start_edit_selected();
+            }
             _ => {}
         }
         Ok(false)
+    }
+
+    fn start_edit_selected(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        // Sources for the picker exclude the profile being edited so an
+        // assume-role profile can't accidentally pick itself as its own
+        // source mid-rename.
+        let sources: Vec<String> = self
+            .sso_profile_names()
+            .into_iter()
+            .filter(|n| n != &name)
+            .collect();
+        let Some(profile) = self.profiles.profiles.get(&name) else {
+            return;
+        };
+        match AddForm::new_for_edit(profile, &name, sources) {
+            Some(form) => {
+                self.form = form;
+                self.status = None;
+                self.screen = Screen::Add;
+            }
+            None => {
+                self.status = Some((
+                    format!("'{name}' is an unknown profile type — cannot edit"),
+                    true,
+                ));
+            }
+        }
     }
 
     fn handle_add(&mut self, key: KeyEvent) -> Result<bool> {
@@ -476,22 +583,26 @@ impl App {
                     field.pop();
                 }
             }
-            KeyCode::Enter => match self.save_form() {
-                Ok(name) => {
-                    self.refresh();
-                    if let Some(i) = self.profile_names.iter().position(|n| n == &name) {
-                        self.list_state.select(Some(i));
+            KeyCode::Enter => {
+                let was_edit = self.form.mode.is_edit();
+                match self.save_form() {
+                    Ok(name) => {
+                        self.refresh();
+                        if let Some(i) = self.profile_names.iter().position(|n| n == &name) {
+                            self.list_state.select(Some(i));
+                        }
+                        let verb = if was_edit { "updated" } else { "saved" };
+                        self.status = Some((
+                            format!("{verb} profile '{name}' — press 't' to test it"),
+                            false,
+                        ));
+                        self.screen = Screen::List;
                     }
-                    self.status = Some((
-                        format!("saved profile '{name}' — press 't' to test it"),
-                        false,
-                    ));
-                    self.screen = Screen::List;
+                    Err(e) => {
+                        self.status = Some((format!("{e}"), true));
+                    }
                 }
-                Err(e) => {
-                    self.status = Some((format!("{e}"), true));
-                }
-            },
+            }
             KeyCode::Char(' ') if self.form.focused == 0 => self.form.toggle_kind(),
             KeyCode::Char(' ') if self.form.is_source_picker_focused() => {
                 self.form.cycle_source(true);
@@ -560,27 +671,50 @@ impl App {
 
     fn save_form(&mut self) -> Result<String> {
         let new_profile = self.form.validate()?;
-        let name = new_profile.name().to_string();
-        if self.profiles.profiles.contains_key(&name) {
-            return Err(anyhow!("a profile named '{name}' already exists"));
+        let new_name = new_profile.name().to_string();
+        let mut profiles = self.profiles.clone();
+        let mut renamed_from: Option<String> = None;
+
+        match &self.form.mode {
+            FormMode::Add => {
+                if profiles.profiles.contains_key(&new_name) {
+                    return Err(anyhow!("a profile named '{new_name}' already exists"));
+                }
+            }
+            FormMode::Edit { original_name } => {
+                if &new_name != original_name && profiles.profiles.contains_key(&new_name) {
+                    return Err(anyhow!("a profile named '{new_name}' already exists"));
+                }
+                profiles.profiles.remove(original_name);
+                if &new_name != original_name {
+                    renamed_from = Some(original_name.clone());
+                }
+            }
         }
-        // For Assume Role profiles, the source profile must already exist —
-        // otherwise the credential_process chain has nothing to assume from.
+
+        // Source profile must exist after the in-memory edits — but check
+        // against `profiles` (post-removal) so an assume-role profile being
+        // renamed doesn't accidentally find its old self as a valid source.
         if let NewProfile::Assume(p) = &new_profile {
-            if !self.profiles.profiles.contains_key(&p.source_profile) {
+            if !profiles.profiles.contains_key(&p.source_profile) {
                 return Err(anyhow!(
                     "source profile '{}' does not exist — add it first",
                     p.source_profile
                 ));
             }
         }
-        let mut profiles = self.profiles.clone();
+
         profiles
             .profiles
-            .insert(name.clone(), new_profile.into_profile());
+            .insert(new_name.clone(), new_profile.into_profile());
         save_profiles_to_file(&profiles)?;
-        write_profile_to_aws_config(&name)?;
-        Ok(name)
+        // Drop the old entry from ~/.aws/config so a renamed profile doesn't
+        // leave a stale credential_process line pointing at a dead key.
+        if let Some(old) = renamed_from {
+            let _ = remove_profile_from_aws_config(&old);
+        }
+        write_profile_to_aws_config(&new_name)?;
+        Ok(new_name)
     }
 
     // Spawn `aws sts get-caller-identity --profile <name>` with piped stdio
@@ -725,7 +859,7 @@ fn render_list(app: &mut App, f: &mut Frame) {
             Style::default().fg(Color::Green),
         )),
         None => Line::from(
-            "[↑↓ / jk] navigate  [Enter] details  [a] add  [t] test  [r] refresh  [q] quit",
+            "[↑↓/jk] nav  [Enter] details  [a] add  [e] edit  [t] test  [r] refresh  [q] quit",
         ),
     };
     f.render_widget(
@@ -752,7 +886,7 @@ fn render_detail(app: &mut App, f: &mut Frame) {
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new("[Esc] back  [t] test with `aws sts get-caller-identity`  [q] quit")
+        Paragraph::new("[Esc] back  [e] edit  [t] test  [q] quit")
             .block(Block::default().borders(Borders::ALL).title(" help ")),
         chunks[1],
     );
@@ -768,33 +902,40 @@ fn render_add(app: &mut App, f: &mut Frame) {
     let mut lines: Vec<Line> = Vec::with_capacity(labels.len() + 3);
     lines.push(Line::from(""));
 
-    // Type-toggle slot.
+    // Type-toggle slot. In edit mode the type is locked to whatever the
+    // existing profile is, since changing it would change the field set
+    // and the on-disk record incompatibly.
+    let is_edit = app.form.mode.is_edit();
     let type_focused = app.form.focused == 0;
     let kind_label = app.form.kind.label();
-    let kind_display = if type_focused {
+    let kind_display = if is_edit {
+        format!("{kind_label} (locked)")
+    } else if type_focused {
         format!("‹ {kind_label} ›")
     } else {
         kind_label.to_string()
     };
-    let type_label_style = if type_focused {
+    let type_label_style = if is_edit {
+        Style::default().fg(Color::DarkGray)
+    } else if type_focused {
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let kind_value_style = if is_edit {
+        Style::default().fg(Color::DarkGray)
+    } else if type_focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
     lines.push(Line::from(vec![
         Span::styled(format!("  {:<18} ", "Profile type"), type_label_style),
-        Span::styled(
-            kind_display,
-            if type_focused {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        ),
+        Span::styled(kind_display, kind_value_style),
     ]));
     lines.push(Line::from(""));
 
@@ -840,19 +981,21 @@ fn render_add(app: &mut App, f: &mut Frame) {
         ]));
     }
 
+    let form_title = match &app.form.mode {
+        FormMode::Add => " add profile ".to_string(),
+        FormMode::Edit { original_name } => format!(" edit profile: {original_name} "),
+    };
     f.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(" add profile ")
-                .borders(Borders::ALL),
-        ),
+        Paragraph::new(lines).block(Block::default().title(form_title).borders(Borders::ALL)),
         chunks[0],
     );
 
-    let default_help = if type_focused {
+    let default_help = if type_focused && !is_edit {
         "[← →] toggle type  [Tab / ↑↓] next field  [Enter] save  [Esc] cancel"
     } else if app.form.is_source_picker_focused() {
         "[← →] cycle source  [Tab / ↑↓] field  [Enter] save  [Esc] cancel"
+    } else if is_edit {
+        "[Tab / ↑↓] field  [Enter] save changes  [Esc] cancel"
     } else {
         "[Tab / ↑↓] field  [Enter] save  [Esc] cancel"
     };
@@ -1040,6 +1183,22 @@ fn write_profile_to_aws_config(profile_name: &str) -> Result<()> {
     conf.with_section(Some(&section))
         .set("credential_process", credential_process.as_str())
         .set("output", "json");
+    conf.write_to_file(aws_config.as_os_str())?;
+    Ok(())
+}
+
+fn remove_profile_from_aws_config(profile_name: &str) -> Result<()> {
+    let aws_config = get_aws_config()?;
+    let mut conf = match Ini::load_from_file(aws_config.as_os_str()) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // nothing to remove
+    };
+    let section = if profile_name == "default" {
+        "default".to_string()
+    } else {
+        format!("profile {profile_name}")
+    };
+    conf.delete(Some(section.as_str()));
     conf.write_to_file(aws_config.as_os_str())?;
     Ok(())
 }
