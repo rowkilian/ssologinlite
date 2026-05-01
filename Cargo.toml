@@ -4,6 +4,7 @@ version = "0.4.0"
 edition = "2021"
 authors = ["Kilian Rault"]
 homepage = "https://github.com/rowkilian/ssologinlite"
+license = "MIT"
 rust-version = "1.77.2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
