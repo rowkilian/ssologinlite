@@ -21,7 +21,8 @@ use std::thread;
 use std::time::Duration;
 
 use crate::aws_profile::{AssumeSsoProfile, Profile, Profiles, SsoProfile};
-use crate::constants::{PROFILES, PROGRAM_FOLDER};
+use crate::config::ProgramConfig;
+use crate::constants::{CONFIG_FILE, PROFILES, PROGRAM_FOLDER};
 use crate::file_helper::{
     get_aws_config, get_exe_path, get_home_os_string, restrict_file_permissions,
 };
@@ -361,7 +362,60 @@ enum Screen {
     List,
     Detail,
     Add,
+    Config(ConfigForm),
     Test(TestRun),
+}
+
+const CONFIG_FIELD_LABELS: [&str; 2] = ["browser", "default_sso_url"];
+
+// Edits the persistent program config at ~/.config/ssologinlite.toml. The
+// file has two optional string keys (browser, default_sso_url); we treat an
+// empty input string as Option::None on save.
+struct ConfigForm {
+    fields: [String; 2],
+    focused: usize,
+    error: Option<String>,
+}
+
+impl ConfigForm {
+    fn from_disk() -> Self {
+        let loaded = read_program_config_toml().unwrap_or_default();
+        ConfigForm {
+            fields: [
+                loaded.browser.unwrap_or_default(),
+                loaded.default_sso_url.unwrap_or_default(),
+            ],
+            focused: 0,
+            error: None,
+        }
+    }
+
+    fn next(&mut self) {
+        self.focused = (self.focused + 1) % CONFIG_FIELD_LABELS.len();
+    }
+
+    fn prev(&mut self) {
+        self.focused = (self.focused + CONFIG_FIELD_LABELS.len() - 1) % CONFIG_FIELD_LABELS.len();
+    }
+
+    fn focused_mut(&mut self) -> &mut String {
+        &mut self.fields[self.focused]
+    }
+
+    fn to_program_config(&self) -> ProgramConfig {
+        let some_or_none = |s: &str| -> Option<String> {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        ProgramConfig {
+            browser: some_or_none(&self.fields[0]),
+            default_sso_url: some_or_none(&self.fields[1]),
+        }
+    }
 }
 
 // Output from the spawned `aws sts get-caller-identity` subprocess. Reader
@@ -461,6 +515,7 @@ impl App {
             Screen::List => self.handle_list(key),
             Screen::Detail => self.handle_detail(key),
             Screen::Add => self.handle_add(key),
+            Screen::Config(_) => self.handle_config(key),
             Screen::Test(_) => self.handle_test(key),
         }
     }
@@ -494,6 +549,10 @@ impl App {
             }
             KeyCode::Char('e') => {
                 self.start_edit_selected();
+            }
+            KeyCode::Char('c') => {
+                self.screen = Screen::Config(ConfigForm::from_disk());
+                self.status = None;
             }
             KeyCode::Char('r') => {
                 self.refresh();
@@ -611,6 +670,42 @@ impl App {
                 if let Some(field) = self.form.focused_field_mut() {
                     field.push(c);
                 }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_config(&mut self, key: KeyEvent) -> Result<bool> {
+        let Screen::Config(form) = &mut self.screen else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::List;
+            }
+            KeyCode::Tab | KeyCode::Down => form.next(),
+            KeyCode::BackTab | KeyCode::Up => form.prev(),
+            KeyCode::Backspace => {
+                form.focused_mut().pop();
+            }
+            KeyCode::Enter => {
+                let cfg = form.to_program_config();
+                match write_program_config_toml(&cfg) {
+                    Ok(()) => {
+                        self.status = Some((
+                            "config saved to ~/.config/ssologinlite.toml".to_string(),
+                            false,
+                        ));
+                        self.screen = Screen::List;
+                    }
+                    Err(e) => {
+                        form.error = Some(format!("{e}"));
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                form.focused_mut().push(c);
             }
             _ => {}
         }
@@ -798,8 +893,73 @@ fn render(app: &mut App, f: &mut Frame) {
         Screen::List => render_list(app, f),
         Screen::Detail => render_detail(app, f),
         Screen::Add => render_add(app, f),
+        Screen::Config(form) => render_config(form, f),
         Screen::Test(run) => render_test(run, f),
     }
+}
+
+fn render_config(form: &ConfigForm, f: &mut Frame) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
+        .split(f.area());
+
+    let mut lines: Vec<Line> = Vec::with_capacity(CONFIG_FIELD_LABELS.len() + 4);
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  ~/.config/ssologinlite.toml",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    lines.push(Line::from(""));
+    for (i, label) in CONFIG_FIELD_LABELS.iter().enumerate() {
+        let value = &form.fields[i];
+        let is_focused = form.focused == i;
+        let display = if is_focused {
+            format!("{value}█")
+        } else if value.is_empty() {
+            "(unset)".to_string()
+        } else {
+            value.clone()
+        };
+        let label_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let value_style = if value.is_empty() && !is_focused {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<18} "), label_style),
+            Span::styled(display, value_style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  empty value clears the key on save",
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().title(" config ").borders(Borders::ALL)),
+        chunks[0],
+    );
+
+    let help = match &form.error {
+        Some(e) => Line::from(Span::styled(
+            format!("✗ {e}"),
+            Style::default().fg(Color::Red),
+        )),
+        None => Line::from("[Tab / ↑↓] field  [Enter] save  [Esc] cancel"),
+    };
+    f.render_widget(
+        Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" help ")),
+        chunks[1],
+    );
 }
 
 fn render_list(app: &mut App, f: &mut Frame) {
@@ -859,7 +1019,7 @@ fn render_list(app: &mut App, f: &mut Frame) {
             Style::default().fg(Color::Green),
         )),
         None => Line::from(
-            "[↑↓/jk] nav  [Enter] details  [a] add  [e] edit  [t] test  [r] refresh  [q] quit",
+            "[↑↓/jk] nav  [Enter] details  [a] add  [e] edit  [t] test  [c] config  [r] refresh  [q] quit",
         ),
     };
     f.render_widget(
@@ -1185,6 +1345,39 @@ fn write_profile_to_aws_config(profile_name: &str) -> Result<()> {
         .set("output", "json");
     conf.write_to_file(aws_config.as_os_str())?;
     Ok(())
+}
+
+// Read ~/.config/ssologinlite.toml directly (no env-var overrides) so the
+// form shows what's actually persisted to disk. The `config` crate's
+// ProgramConfig::new() merges env vars on top, which would surprise the user
+// when they edit and re-save.
+fn read_program_config_toml() -> Result<ProgramConfig> {
+    let path = config_toml_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ProgramConfig::default()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(toml::from_str(&raw)?)
+}
+
+fn write_program_config_toml(cfg: &ProgramConfig) -> Result<()> {
+    let path = config_toml_path()?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let serialised = toml::to_string_pretty(cfg)?;
+    std::fs::write(&path, serialised)?;
+    Ok(())
+}
+
+fn config_toml_path() -> Result<std::ffi::OsString> {
+    // CONFIG_FILE is ".config/ssologinlite" (no extension) because the config
+    // crate's File::with_name auto-resolves the extension on read. For
+    // writing, we pin to .toml since that's the format we serialise.
+    let mut path = std::path::PathBuf::from(get_home_os_string(CONFIG_FILE)?);
+    path.set_extension("toml");
+    Ok(path.into_os_string())
 }
 
 fn remove_profile_from_aws_config(profile_name: &str) -> Result<()> {

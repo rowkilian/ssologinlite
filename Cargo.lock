@@ -2265,6 +2265,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "toml",
  "url-search-params",
  "webbrowser",
  "whoami",
