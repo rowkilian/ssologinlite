@@ -538,10 +538,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter => {
-                if self.selected_profile().is_some() {
-                    self.screen = Screen::Detail;
-                }
+            KeyCode::Enter if self.selected_profile().is_some() => {
+                self.screen = Screen::Detail;
             }
             KeyCode::Char('a') => {
                 self.form = AddForm::new(self.sso_profile_names());
