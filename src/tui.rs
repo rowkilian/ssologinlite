@@ -551,6 +551,9 @@ impl App {
             KeyCode::Char('e') => {
                 self.start_edit_selected();
             }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.set_selected_as_default();
+            }
             KeyCode::Char('c') => {
                 self.screen = Screen::Config(ConfigForm::from_disk());
                 self.status = None;
@@ -589,9 +592,68 @@ impl App {
             KeyCode::Char('e') => {
                 self.start_edit_selected();
             }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.set_selected_as_default();
+            }
             _ => {}
         }
         Ok(false)
+    }
+
+    // Clone the selected profile into a `default` entry in profiles.json and
+    // write the matching [default] section to ~/.aws/config. Overwrites any
+    // existing default. The source profile is left untouched, so the user
+    // keeps both names.
+    fn set_selected_as_default(&mut self) {
+        let Some(name) = self.selected_name() else {
+            return;
+        };
+        if name == "default" {
+            self.status = Some(("'default' is already this profile".to_string(), false));
+            return;
+        }
+        let Some(source) = self.profiles.profiles.get(&name).cloned() else {
+            return;
+        };
+        let default_profile = match source {
+            Profile::SsoProfile(mut p) => {
+                p.profile_name = "default".to_string();
+                Profile::SsoProfile(p)
+            }
+            Profile::AssumeSsoProfile(mut p) => {
+                p.profile_name = "default".to_string();
+                Profile::AssumeSsoProfile(p)
+            }
+            Profile::OtherProfile => {
+                self.status = Some((
+                    "cannot make an unknown profile type the default".to_string(),
+                    true,
+                ));
+                return;
+            }
+        };
+
+        let had_default = self.profiles.profiles.contains_key("default");
+        let mut profiles = self.profiles.clone();
+        profiles
+            .profiles
+            .insert("default".to_string(), default_profile);
+
+        if let Err(e) = save_profiles_to_file(&profiles) {
+            self.status = Some((format!("failed to save profiles: {e}"), true));
+            return;
+        }
+        if let Err(e) = write_profile_to_aws_config("default") {
+            self.status = Some((format!("failed to write [default]: {e}"), true));
+            return;
+        }
+        self.refresh();
+        let msg = if had_default {
+            format!("replaced default profile with a copy of '{name}'")
+        } else {
+            format!("set '{name}' as the default profile")
+        };
+        self.status = Some((msg, false));
     }
 
     fn start_edit_selected(&mut self) {
@@ -1028,7 +1090,7 @@ fn render_list(app: &mut App, f: &mut Frame) {
             Style::default().fg(Color::Green),
         )),
         None => Line::from(
-            "[↑↓/jk] nav  [Enter] details  [a]dd  [e]dit  [t]est  [x] export  [c]onfig  [r]efresh  [q]uit",
+            "[↑↓/jk] nav  [Enter] details  [a]dd  [e]dit  [d]efault  [t]est  [x] export  [c]onfig  [r]efresh  [q]uit",
         ),
     };
     f.render_widget(
@@ -1055,7 +1117,7 @@ fn render_detail(app: &mut App, f: &mut Frame) {
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new("[Esc] back  [e] edit  [t] test  [q] quit")
+        Paragraph::new("[Esc] back  [e] edit  [d] default  [t] test  [q] quit")
             .block(Block::default().borders(Borders::ALL).title(" help ")),
         chunks[1],
     );
