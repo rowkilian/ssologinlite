@@ -134,8 +134,10 @@ async fn main() -> Result<ExitCode> {
     Ok(ExitCode::from(0))
 }
 
-// Custom error enum
+// Custom error enum. The shared "Error" suffix is intentional and matches
+// the pattern used by sibling modules' MyErrors enums.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 enum MyErrors {
     RegionNotFoundError,
     ProfileNotFoundError,

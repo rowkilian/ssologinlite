@@ -163,13 +163,13 @@ fn sha256(data: &String) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn hmac_sha_256(key: &Vec<u8>, data: &Vec<u8>) -> Vec<u8> {
+fn hmac_sha_256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     hasher.update(data);
     hasher.finalize().into_bytes().to_vec()
 }
 
-fn hmac_sha_256_hex(key: &Vec<u8>, data: &String) -> String {
+fn hmac_sha_256_hex(key: &[u8], data: &str) -> String {
     let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
     hasher.update(data.as_bytes());
     format!("{:x}", hasher.finalize().into_bytes())
@@ -212,7 +212,7 @@ fn get_query_parameters(options: &GetSignedUrlOptions, for_canonical: bool) -> S
 
 fn get_canonical_request(
     options: &GetSignedUrlOptions,
-    query_parameters: &String,
+    query_parameters: &str,
     cluster: &String,
 ) -> String {
     // let key = &("/".to_string() + &options.key);
@@ -571,12 +571,16 @@ mod tests {
 
     #[test]
     fn test_different_regions_produce_different_urls() {
-        let mut options1 = GetSignedUrlOptions::default();
-        options1.region = "us-east-1".to_string();
-
-        let mut options2 = GetSignedUrlOptions::default();
-        options2.region = "eu-west-1".to_string();
-        options2.date = options1.date; // Same date for comparison
+        let options1 = GetSignedUrlOptions {
+            region: "us-east-1".to_string(),
+            ..GetSignedUrlOptions::default()
+        };
+        let options2 = GetSignedUrlOptions {
+            region: "eu-west-1".to_string(),
+            // Same date for comparison so only region differs.
+            date: options1.date,
+            ..GetSignedUrlOptions::default()
+        };
 
         let cluster = "test-cluster".to_string();
         let url1 = get_signed_url(&options1, &cluster);
