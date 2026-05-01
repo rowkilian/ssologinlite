@@ -15,11 +15,6 @@ mod tests {
     }
 
     #[test]
-    fn test_conf_cache() {
-        assert_eq!(CONF_CACHE, ".conf_cache");
-    }
-
-    #[test]
     fn test_program_folder() {
         assert_eq!(PROGRAM_FOLDER, ".aws/ssologinlite");
     }

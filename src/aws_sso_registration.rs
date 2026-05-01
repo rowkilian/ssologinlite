@@ -41,10 +41,12 @@ impl SsoRegistration {
     }
 
     pub fn is_expired(&self) -> bool {
-        // parse_from_rfc3339 accepts every valid RFC3339 timestamp (with or
-        // without fractional seconds, with `Z` or `+HH:MM` offset) and is
-        // timezone-aware, so comparing against Utc::now() is correct in any
-        // local timezone.
+        // register_client writes expiresAt via DateTime<Utc>::to_rfc3339(), which
+        // produces "2026-04-30T12:34:56.123456789+00:00" — fractional seconds + a
+        // colon-form offset. The previous NaiveDateTime + "%z" parser rejected
+        // both. parse_from_rfc3339 accepts every valid RFC3339 timestamp and is
+        // timezone-aware, so comparing against Utc::now() is correct in any local
+        // timezone.
         let exp_dt = match DateTime::parse_from_rfc3339(&self.expiresAt) {
             Ok(expiration) => expiration.with_timezone(&Utc),
             Err(e) => {

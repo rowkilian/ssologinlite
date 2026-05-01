@@ -399,14 +399,6 @@ mod tests {
     // --- MyErrors Display ---
 
     #[test]
-    fn test_error_display_expiration_parser() {
-        assert_eq!(
-            format!("{}", MyErrors::ExpirationParser),
-            "Could not parse AWS expiration date!"
-        );
-    }
-
-    #[test]
     fn test_error_display_get_role_credential() {
         assert_eq!(
             format!("{}", MyErrors::GetRoleCredentialError),

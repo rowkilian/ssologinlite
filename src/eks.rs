@@ -1,6 +1,6 @@
 use crate::aws_credentials::AWScredentials;
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use hmac::{Hmac, Mac};
 use log::debug;
@@ -65,9 +65,13 @@ impl Status {
             credentials.SessionToken,
         );
         let url = get_signed_url(&signed_url, cluster);
-        let encoded_url = base64_encode(&url).trim_end_matches('=').to_string();
-        let sanitized_encoded_url = encoded_url.replace("/", "_");
-        let token = format!("{}{}", TOKEN_PREFIX, sanitized_encoded_url);
+        // EKS exec credential tokens require base64url (RFC 4648 §5):
+        // URL-safe alphabet (- and _ instead of + and /), no padding. The
+        // URL_SAFE_NO_PAD engine handles all of that in one step. The
+        // previous implementation used STANDARD base64 + manual `/` → `_`
+        // and trailing `=` strip, which left `+` characters intact and
+        // produced strings that were not strictly valid base64url.
+        let token = format!("{}{}", TOKEN_PREFIX, base64url_encode(&url));
         let expiration_timestamp = (Utc::now() + Duration::minutes(TOKEN_EXPIRATION_MINS))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
@@ -290,8 +294,8 @@ pub fn get_signed_url(options: &GetSignedUrlOptions, cluster: &String) -> String
     get_url(options, query_parameters, signature)
 }
 
-fn base64_encode(data: &String) -> String {
-    STANDARD.encode(data)
+fn base64url_encode(data: &str) -> String {
+    URL_SAFE_NO_PAD.encode(data)
 }
 
 fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool) -> String {
@@ -353,17 +357,21 @@ mod tests {
     }
 
     #[test]
-    fn test_base64_encode() {
-        let input = "test".to_string();
-        let encoded = base64_encode(&input);
-        assert_eq!(encoded, "dGVzdA==");
+    fn test_base64url_encode() {
+        // URL_SAFE_NO_PAD: same alphabet as standard base64 except + → -,
+        // / → _, with trailing `=` padding stripped.
+        assert_eq!(base64url_encode("test"), "dGVzdA");
     }
 
     #[test]
-    fn test_base64_encode_padding_removal() {
-        let input = "https://example.com".to_string();
-        let encoded = base64_encode(&input);
-        assert!(encoded.ends_with("=") || !encoded.is_empty());
+    fn test_base64url_encode_uses_url_safe_alphabet() {
+        // The byte sequence [0xfb, 0xff, 0xbf] encodes to "+/+/" in standard
+        // base64; URL_SAFE_NO_PAD must produce "-_-_" (no `+`, no `/`, no `=`).
+        let raw = [0xfbu8, 0xff, 0xbf];
+        let encoded = URL_SAFE_NO_PAD.encode(raw);
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
     }
 
     #[test]
@@ -623,20 +631,21 @@ mod tests {
             .token
             .strip_prefix(TOKEN_PREFIX)
             .expect("token must start with k8s-aws-v1.");
-        let restored = encoded.replace('_', "/");
-        // base64 needs length divisible by 4; re-add the trimmed `=` padding.
-        let padded = match restored.len() % 4 {
-            0 => restored,
-            n => format!("{restored}{}", "=".repeat(4 - n)),
-        };
-        let bytes = STANDARD
-            .decode(&padded)
-            .expect("token suffix must decode as base64");
+        // The token uses base64url with no padding; decode with the matching
+        // engine and no manual character substitution.
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("token suffix must decode as base64url (no-pad)");
         let decoded_url = String::from_utf8(bytes).expect("decoded bytes must be UTF-8");
 
         assert!(decoded_url.starts_with("https://sts.us-west-2.amazonaws.com/"));
         assert!(decoded_url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
         assert!(decoded_url.contains("X-Amz-Signature="));
         assert!(decoded_url.contains("X-Amz-Security-Token="));
+        // The token's encoded portion must use only the URL-safe alphabet —
+        // no `+`, `/`, or `=` from STANDARD base64.
+        assert!(!encoded.contains('+'));
+        assert!(!encoded.contains('/'));
+        assert!(!encoded.contains('='));
     }
 }

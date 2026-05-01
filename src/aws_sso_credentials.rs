@@ -92,7 +92,10 @@ impl SsoCredentials {
         let device_code = url_code.device_code;
         let url_as_str = url_code.url;
 
-        debug!("opening browser with url: {}", url_as_str);
+        // The verification URL embeds the user_code; logging it would let
+        // anyone with read access to the log complete the SSO authorization
+        // as the user. Log a benign message instead.
+        debug!("opening browser to complete SSO authorization");
         open_url(conf, url_as_str.clone()).map_err(|e| {
             error!("aws_sso_credentials.SsoCredentials.refresh open_url: {}", e);
             anyhow!(MyErrors::GetUrlError)
@@ -107,11 +110,25 @@ impl SsoCredentials {
                     return Ok(creds);
                 }
                 Err(e) => {
-                    // create_token errors are expected during the polling phase
-                    // (AuthorizationPendingException), so treat them as "not yet"
-                    // and keep polling until the deadline.
-                    debug!("device-code not yet authorized: {}", e);
-                    continue;
+                    // create_token uses MyErrors::AuthorizationPending for the
+                    // expected "not-yet-authorized" / "slow down" responses;
+                    // anything else (invalid client/grant, expired device code,
+                    // access denied, network error) is fatal and we surface it
+                    // immediately rather than burning the rest of the deadline
+                    // on a permanent failure.
+                    let pending = e
+                        .downcast_ref::<MyErrors>()
+                        .map(|me| matches!(me, MyErrors::AuthorizationPending))
+                        .unwrap_or(false);
+                    if pending {
+                        debug!("device-code not yet authorized; continuing to poll");
+                        continue;
+                    }
+                    error!(
+                        "aws_sso_credentials.SsoCredentials.refresh: fatal error during polling: {}",
+                        e
+                    );
+                    return Err(e);
                 }
             }
         }
@@ -212,6 +229,26 @@ impl SsoCredentials {
         {
             Ok(output) => output,
             Err(e) => {
+                // The polling loop in refresh() distinguishes "not yet
+                // authorized" / "slow down" from fatal errors; tag the
+                // expected polling responses with AuthorizationPending so
+                // the caller can keep waiting, and fail fast on everything
+                // else (invalid client/grant, expired device code, access
+                // denied, network errors).
+                use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
+                if matches!(
+                    e.as_service_error(),
+                    Some(
+                        CreateTokenError::AuthorizationPendingException(_)
+                            | CreateTokenError::SlowDownException(_)
+                    )
+                ) {
+                    debug!(
+                        "aws_sso_credentials.SsoCredentials.create_token (pending): {}",
+                        e
+                    );
+                    return Err(anyhow!(MyErrors::AuthorizationPending));
+                }
                 error!("aws_sso_credentials.SsoCredentials.create_token {}", e);
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
             }
@@ -272,6 +309,10 @@ enum MyErrors {
     GetRoleCredentialError,
     GetUrlError,
     CredentialsFromURLError,
+    // Tags create_token's expected polling responses (AuthorizationPending /
+    // SlowDown) so the refresh() loop can distinguish "keep waiting" from
+    // a fatal SDK error and fail fast on the latter.
+    AuthorizationPending,
 }
 
 impl std::fmt::Display for MyErrors {
@@ -281,6 +322,9 @@ impl std::fmt::Display for MyErrors {
             Self::GetRoleCredentialError => write!(f, "Error getting credentials!"),
             Self::GetUrlError => write!(f, "Error getting URL!"),
             Self::CredentialsFromURLError => write!(f, "Error getting credentials with URL!"),
+            Self::AuthorizationPending => {
+                write!(f, "device-code authorization is still pending")
+            }
         }
     }
 }
@@ -386,11 +430,15 @@ mod tests {
         let uc = UrlCode {
             device_code: "dev-code".to_string(),
             url: "https://example.com".to_string(),
+            expires_in: 600,
+            interval: 1,
         };
         let json = serde_json::to_string(&uc).unwrap();
         let deser: UrlCode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.device_code, "dev-code");
         assert_eq!(deser.url, "https://example.com");
+        assert_eq!(deser.expires_in, 600);
+        assert_eq!(deser.interval, 1);
     }
 
     // --- Default ---
