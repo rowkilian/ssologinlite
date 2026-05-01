@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use chrono::Local;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -554,6 +555,14 @@ impl App {
                 self.screen = Screen::Config(ConfigForm::from_disk());
                 self.status = None;
             }
+            KeyCode::Char('x') => match export_aws_config(&self.profiles) {
+                Ok(path) => {
+                    self.status = Some((format!("exported to {}", path.display()), false));
+                }
+                Err(e) => {
+                    self.status = Some((format!("export failed: {e}"), true));
+                }
+            },
             KeyCode::Char('r') => {
                 self.refresh();
                 self.status = Some(("refreshed".to_string(), false));
@@ -1019,7 +1028,7 @@ fn render_list(app: &mut App, f: &mut Frame) {
             Style::default().fg(Color::Green),
         )),
         None => Line::from(
-            "[↑↓/jk] nav  [Enter] details  [a] add  [e] edit  [t] test  [c] config  [r] refresh  [q] quit",
+            "[↑↓/jk] nav  [Enter] details  [a]dd  [e]dit  [t]est  [x] export  [c]onfig  [r]efresh  [q]uit",
         ),
     };
     f.render_widget(
@@ -1378,6 +1387,70 @@ fn config_toml_path() -> Result<std::ffi::OsString> {
     let mut path = std::path::PathBuf::from(get_home_os_string(CONFIG_FILE)?);
     path.set_extension("toml");
     Ok(path.into_os_string())
+}
+
+// Serialise the in-memory Profiles to a vanilla AWS CLI config file —
+// SSO and assume-role sections written with their native keys, no
+// credential_process line. Useful as a portable backup or for switching
+// off ssologinlite without losing the profile catalogue.
+//
+// Writes to ~/.aws/ssologinlite/config.exported.<YYYYMMDDTHHMMSS> at 0o600.
+// Returns the path so the TUI can show it in the status bar.
+fn export_aws_config(profiles: &Profiles) -> Result<std::path::PathBuf> {
+    let timestamp = Local::now().format("%Y%m%dT%H%M%S").to_string();
+    let path_os =
+        get_home_os_string(format!("{PROGRAM_FOLDER}/config.exported.{timestamp}").as_str())?;
+    let path = std::path::PathBuf::from(&path_os);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut conf = Ini::new();
+    // Sort by name so re-running export with the same profile set gives
+    // diffable output, which makes the file useful as a snapshot.
+    let mut sorted: Vec<(&String, &Profile)> = profiles.profiles.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (name, profile) in sorted {
+        // The default profile uses [default], not [profile default], in
+        // ~/.aws/config.
+        let section = if name == "default" {
+            "default".to_string()
+        } else {
+            format!("profile {name}")
+        };
+        match profile {
+            Profile::SsoProfile(p) => {
+                let mut sec = conf.with_section(Some(&section));
+                sec.set("sso_start_url", p.sso_start_url.as_str())
+                    .set("sso_region", p.sso_region.as_str())
+                    .set("sso_account_id", p.sso_account_id.as_str())
+                    .set("sso_role_name", p.sso_role_name.as_str());
+                if let Some(r) = &p.region {
+                    sec.set("region", r.as_str());
+                }
+                if let Some(d) = p.duration_seconds {
+                    sec.set("duration_seconds", d.to_string().as_str());
+                }
+                sec.set("output", "json");
+            }
+            Profile::AssumeSsoProfile(p) => {
+                conf.with_section(Some(&section))
+                    .set("source_profile", p.source_profile.as_str())
+                    .set("role_arn", p.role_arn.as_str())
+                    .set("region", p.region.as_str())
+                    .set("output", "json");
+            }
+            Profile::OtherProfile => {
+                // No fields to round-trip — skip.
+                continue;
+            }
+        }
+    }
+
+    conf.write_to_file(&path)?;
+    let _ = restrict_file_permissions(&path_os);
+    Ok(path)
 }
 
 fn remove_profile_from_aws_config(profile_name: &str) -> Result<()> {
