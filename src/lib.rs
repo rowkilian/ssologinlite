@@ -10,3 +10,4 @@ pub mod file_helper;
 pub mod logger;
 pub mod mywebbrowser;
 pub mod parser;
+pub mod tui;

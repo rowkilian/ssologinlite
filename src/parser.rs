@@ -28,6 +28,8 @@ pub enum Commands {
     SSOExpiration,
     /// Exit code 0 if sso login is required.
     SSOExpiresSoon,
+    /// Browse / add profiles in an interactive TUI.
+    Tui,
 }
 
 #[derive(Args)]

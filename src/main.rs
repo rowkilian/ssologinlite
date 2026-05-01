@@ -9,6 +9,7 @@ use ssologinlite::config::ProgramConfig;
 use ssologinlite::eks::EksToken;
 use ssologinlite::logger::logger;
 use ssologinlite::parser::{Cli, Commands};
+use ssologinlite::tui;
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -106,6 +107,9 @@ async fn main() -> Result<ExitCode> {
                 ),
             };
             print!("{}", sso_expiration);
+        }
+        Commands::Tui => {
+            tui::run()?;
         }
         Commands::SSOExpiresSoon => {
             let conf = ProgramConfig::new()?;
