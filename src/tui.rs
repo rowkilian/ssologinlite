@@ -82,25 +82,35 @@ impl NewProfile {
 // active kind's field array. SSO and assume-role values are kept in
 // independent buffers so flipping the type back and forth doesn't lose
 // what the user has already typed.
+// Index into ASSUME_FIELD_LABELS for the source-profile slot. The slot is
+// rendered as a picker over existing SSO profiles rather than a free-text
+// input — an Assume Role profile chains off an SSO profile, so the source
+// must already exist in profiles.json.
+const ASSUME_SOURCE_FIELD: usize = 1;
+
 struct AddForm {
     kind: ProfileKind,
     sso_values: [String; 7],
     assume_values: [String; 4],
     focused: usize,
-}
-
-impl Default for AddForm {
-    fn default() -> Self {
-        AddForm {
-            kind: ProfileKind::Sso,
-            sso_values: Default::default(),
-            assume_values: Default::default(),
-            focused: 0,
-        }
-    }
+    available_sources: Vec<String>,
 }
 
 impl AddForm {
+    fn new(available_sources: Vec<String>) -> Self {
+        let mut assume_values: [String; 4] = Default::default();
+        if let Some(first) = available_sources.first() {
+            assume_values[ASSUME_SOURCE_FIELD] = first.clone();
+        }
+        AddForm {
+            kind: ProfileKind::Sso,
+            sso_values: Default::default(),
+            assume_values,
+            focused: 0,
+            available_sources,
+        }
+    }
+
     fn field_labels(&self) -> &'static [&'static str] {
         match self.kind {
             ProfileKind::Sso => &SSO_FIELD_LABELS,
@@ -138,10 +148,38 @@ impl AddForm {
 
     fn focused_field_mut(&mut self) -> Option<&mut String> {
         let i = self.focused_field_index()?;
+        // The Assume-Role source slot is a picker, not a free-text input —
+        // refuse mutable access so Char/Backspace handlers can't corrupt it.
+        if self.is_source_picker_focused() {
+            return None;
+        }
         match self.kind {
             ProfileKind::Sso => self.sso_values.get_mut(i),
             ProfileKind::AssumeSso => self.assume_values.get_mut(i),
         }
+    }
+
+    fn is_source_picker_focused(&self) -> bool {
+        self.kind == ProfileKind::AssumeSso && self.focused == ASSUME_SOURCE_FIELD + 1
+    }
+
+    fn cycle_source(&mut self, forward: bool) {
+        if self.available_sources.is_empty() {
+            return;
+        }
+        let n = self.available_sources.len();
+        let current = &self.assume_values[ASSUME_SOURCE_FIELD];
+        let current_idx = self
+            .available_sources
+            .iter()
+            .position(|s| s == current)
+            .unwrap_or(0);
+        let new_idx = if forward {
+            (current_idx + 1) % n
+        } else {
+            (current_idx + n - 1) % n
+        };
+        self.assume_values[ASSUME_SOURCE_FIELD] = self.available_sources[new_idx].clone();
     }
 
     fn toggle_kind(&mut self) {
@@ -209,15 +247,22 @@ impl AddForm {
 
     fn validate_assume(&self) -> Result<AssumeSsoProfile> {
         let name = self.assume_values[0].trim();
-        let source = self.assume_values[1].trim();
+        let source = self.assume_values[ASSUME_SOURCE_FIELD].trim();
         let arn = self.assume_values[2].trim();
         let region = self.assume_values[3].trim();
 
         if name.is_empty() {
             return Err(anyhow!("Profile name is required"));
         }
-        if source.is_empty() {
-            return Err(anyhow!("Source profile is required"));
+        if self.available_sources.is_empty() {
+            return Err(anyhow!(
+                "no SSO profiles to assume from — add an SSO profile first"
+            ));
+        }
+        if !self.available_sources.iter().any(|s| s == source) {
+            return Err(anyhow!(
+                "source profile must be one of the existing SSO profiles"
+            ));
         }
         if arn.is_empty() {
             return Err(anyhow!("Role ARN is required"));
@@ -265,7 +310,7 @@ impl App {
             profile_names: Vec::new(),
             list_state: ListState::default(),
             screen: Screen::List,
-            form: AddForm::default(),
+            form: AddForm::new(Vec::new()),
             status: None,
         };
         app.refresh();
@@ -284,6 +329,20 @@ impl App {
                 .select(if n == 0 { None } else { Some(n - 1) }),
             _ => {}
         }
+    }
+
+    fn sso_profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .profiles
+            .profiles
+            .iter()
+            .filter_map(|(name, p)| match p {
+                Profile::SsoProfile(_) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        names.sort();
+        names
     }
 
     fn selected_name(&self) -> Option<String> {
@@ -339,7 +398,7 @@ impl App {
                 }
             }
             KeyCode::Char('a') => {
-                self.form = AddForm::default();
+                self.form = AddForm::new(self.sso_profile_names());
                 self.status = None;
                 self.screen = Screen::Add;
             }
@@ -379,9 +438,18 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Down => self.form.next(),
             KeyCode::BackTab | KeyCode::Up => self.form.prev(),
-            KeyCode::Left | KeyCode::Right => {
+            KeyCode::Left => {
                 if self.form.focused == 0 {
                     self.form.toggle_kind();
+                } else if self.form.is_source_picker_focused() {
+                    self.form.cycle_source(false);
+                }
+            }
+            KeyCode::Right => {
+                if self.form.focused == 0 {
+                    self.form.toggle_kind();
+                } else if self.form.is_source_picker_focused() {
+                    self.form.cycle_source(true);
                 }
             }
             KeyCode::Backspace => {
@@ -406,6 +474,9 @@ impl App {
                 }
             },
             KeyCode::Char(' ') if self.form.focused == 0 => self.form.toggle_kind(),
+            KeyCode::Char(' ') if self.form.is_source_picker_focused() => {
+                self.form.cycle_source(true);
+            }
             KeyCode::Char(c) => {
                 if let Some(field) = self.form.focused_field_mut() {
                     field.push(c);
@@ -630,10 +701,21 @@ fn render_add(app: &mut App, f: &mut Frame) {
     lines.push(Line::from(""));
 
     // Field slots for the active kind.
+    let kind = app.form.kind;
+    let sources_empty = app.form.available_sources.is_empty();
     for (i, label) in labels.iter().enumerate() {
         let value = app.form.focused_field_value(i);
         let is_focused = app.form.focused == i + 1;
-        let display = if is_focused {
+        let is_source_picker = kind == ProfileKind::AssumeSso && i == ASSUME_SOURCE_FIELD;
+        let display = if is_source_picker {
+            if sources_empty {
+                "(no SSO profiles available)".to_string()
+            } else if is_focused {
+                format!("‹ {value} ›")
+            } else {
+                value.to_string()
+            }
+        } else if is_focused {
             format!("{value}█")
         } else {
             value.to_string()
@@ -645,9 +727,18 @@ fn render_add(app: &mut App, f: &mut Frame) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let value_style = if is_source_picker && sources_empty {
+            Style::default().fg(Color::Red)
+        } else if is_source_picker && is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("  {label:<18} "), label_style),
-            Span::raw(display),
+            Span::styled(display, value_style),
         ]));
     }
 
@@ -662,6 +753,8 @@ fn render_add(app: &mut App, f: &mut Frame) {
 
     let default_help = if type_focused {
         "[← →] toggle type  [Tab / ↑↓] next field  [Enter] save  [Esc] cancel"
+    } else if app.form.is_source_picker_focused() {
+        "[← →] cycle source  [Tab / ↑↓] field  [Enter] save  [Esc] cancel"
     } else {
         "[Tab / ↑↓] field  [Enter] save  [Esc] cancel"
     };
