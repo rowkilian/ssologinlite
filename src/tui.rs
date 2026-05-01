@@ -25,7 +25,7 @@ use crate::file_helper::{
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
-const FIELD_LABELS: [&str; 7] = [
+const SSO_FIELD_LABELS: [&str; 7] = [
     "Profile name",
     "SSO start URL",
     "SSO region",
@@ -35,30 +35,137 @@ const FIELD_LABELS: [&str; 7] = [
     "Duration (sec)",
 ];
 
-#[derive(Default)]
+const ASSUME_FIELD_LABELS: [&str; 4] = ["Profile name", "Source profile", "Role ARN", "Region"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileKind {
+    Sso,
+    AssumeSso,
+}
+
+impl ProfileKind {
+    fn label(self) -> &'static str {
+        match self {
+            ProfileKind::Sso => "SSO",
+            ProfileKind::AssumeSso => "Assume Role",
+        }
+    }
+    fn toggle(self) -> Self {
+        match self {
+            ProfileKind::Sso => ProfileKind::AssumeSso,
+            ProfileKind::AssumeSso => ProfileKind::Sso,
+        }
+    }
+}
+
+enum NewProfile {
+    Sso(SsoProfile),
+    Assume(AssumeSsoProfile),
+}
+
+impl NewProfile {
+    fn name(&self) -> &str {
+        match self {
+            NewProfile::Sso(p) => &p.profile_name,
+            NewProfile::Assume(p) => &p.profile_name,
+        }
+    }
+    fn into_profile(self) -> Profile {
+        match self {
+            NewProfile::Sso(p) => Profile::SsoProfile(p),
+            NewProfile::Assume(p) => Profile::AssumeSsoProfile(p),
+        }
+    }
+}
+
+// Form layout: focused == 0 is the type toggle; focused 1..=N indexes the
+// active kind's field array. SSO and assume-role values are kept in
+// independent buffers so flipping the type back and forth doesn't lose
+// what the user has already typed.
 struct AddForm {
-    fields: [String; 7],
+    kind: ProfileKind,
+    sso_values: [String; 7],
+    assume_values: [String; 4],
     focused: usize,
 }
 
+impl Default for AddForm {
+    fn default() -> Self {
+        AddForm {
+            kind: ProfileKind::Sso,
+            sso_values: Default::default(),
+            assume_values: Default::default(),
+            focused: 0,
+        }
+    }
+}
+
 impl AddForm {
-    fn focused_mut(&mut self) -> &mut String {
-        &mut self.fields[self.focused]
+    fn field_labels(&self) -> &'static [&'static str] {
+        match self.kind {
+            ProfileKind::Sso => &SSO_FIELD_LABELS,
+            ProfileKind::AssumeSso => &ASSUME_FIELD_LABELS,
+        }
     }
+
+    fn slots(&self) -> usize {
+        // 1 type toggle + N field slots
+        self.field_labels().len() + 1
+    }
+
     fn next(&mut self) {
-        self.focused = (self.focused + 1) % FIELD_LABELS.len();
+        self.focused = (self.focused + 1) % self.slots();
     }
+
     fn prev(&mut self) {
-        self.focused = (self.focused + FIELD_LABELS.len() - 1) % FIELD_LABELS.len();
+        self.focused = (self.focused + self.slots() - 1) % self.slots();
     }
-    fn validate(&self) -> Result<SsoProfile> {
-        let name = self.fields[0].trim();
-        let url = self.fields[1].trim();
-        let sso_region = self.fields[2].trim();
-        let account = self.fields[3].trim();
-        let role = self.fields[4].trim();
-        let region = self.fields[5].trim();
-        let duration = self.fields[6].trim();
+
+    fn focused_field_index(&self) -> Option<usize> {
+        if self.focused == 0 {
+            None
+        } else {
+            Some(self.focused - 1)
+        }
+    }
+
+    fn focused_field_value(&self, i: usize) -> &str {
+        match self.kind {
+            ProfileKind::Sso => &self.sso_values[i],
+            ProfileKind::AssumeSso => &self.assume_values[i],
+        }
+    }
+
+    fn focused_field_mut(&mut self) -> Option<&mut String> {
+        let i = self.focused_field_index()?;
+        match self.kind {
+            ProfileKind::Sso => self.sso_values.get_mut(i),
+            ProfileKind::AssumeSso => self.assume_values.get_mut(i),
+        }
+    }
+
+    fn toggle_kind(&mut self) {
+        self.kind = self.kind.toggle();
+        // Stay parked on the type slot after a toggle so the user sees the
+        // change before stepping into the now-different field list.
+        self.focused = 0;
+    }
+
+    fn validate(&self) -> Result<NewProfile> {
+        match self.kind {
+            ProfileKind::Sso => self.validate_sso().map(NewProfile::Sso),
+            ProfileKind::AssumeSso => self.validate_assume().map(NewProfile::Assume),
+        }
+    }
+
+    fn validate_sso(&self) -> Result<SsoProfile> {
+        let name = self.sso_values[0].trim();
+        let url = self.sso_values[1].trim();
+        let sso_region = self.sso_values[2].trim();
+        let account = self.sso_values[3].trim();
+        let role = self.sso_values[4].trim();
+        let region = self.sso_values[5].trim();
+        let duration = self.sso_values[6].trim();
 
         if name.is_empty() {
             return Err(anyhow!("Profile name is required"));
@@ -97,6 +204,36 @@ impl AddForm {
                 Some(region.to_string())
             },
             duration_seconds,
+        })
+    }
+
+    fn validate_assume(&self) -> Result<AssumeSsoProfile> {
+        let name = self.assume_values[0].trim();
+        let source = self.assume_values[1].trim();
+        let arn = self.assume_values[2].trim();
+        let region = self.assume_values[3].trim();
+
+        if name.is_empty() {
+            return Err(anyhow!("Profile name is required"));
+        }
+        if source.is_empty() {
+            return Err(anyhow!("Source profile is required"));
+        }
+        if arn.is_empty() {
+            return Err(anyhow!("Role ARN is required"));
+        }
+        if !arn.starts_with("arn:aws:iam::") {
+            return Err(anyhow!("Role ARN must start with 'arn:aws:iam::'"));
+        }
+        if region.is_empty() {
+            return Err(anyhow!("Region is required"));
+        }
+
+        Ok(AssumeSsoProfile {
+            profile_name: name.to_string(),
+            source_profile: source.to_string(),
+            role_arn: arn.to_string(),
+            region: region.to_string(),
         })
     }
 }
@@ -242,8 +379,15 @@ impl App {
             }
             KeyCode::Tab | KeyCode::Down => self.form.next(),
             KeyCode::BackTab | KeyCode::Up => self.form.prev(),
+            KeyCode::Left | KeyCode::Right => {
+                if self.form.focused == 0 {
+                    self.form.toggle_kind();
+                }
+            }
             KeyCode::Backspace => {
-                self.form.focused_mut().pop();
+                if let Some(field) = self.form.focused_field_mut() {
+                    field.pop();
+                }
             }
             KeyCode::Enter => match self.save_form() {
                 Ok(name) => {
@@ -261,8 +405,11 @@ impl App {
                     self.status = Some((format!("{e}"), true));
                 }
             },
+            KeyCode::Char(' ') if self.form.focused == 0 => self.form.toggle_kind(),
             KeyCode::Char(c) => {
-                self.form.focused_mut().push(c);
+                if let Some(field) = self.form.focused_field_mut() {
+                    field.push(c);
+                }
             }
             _ => {}
         }
@@ -280,14 +427,24 @@ impl App {
 
     fn save_form(&mut self) -> Result<String> {
         let new_profile = self.form.validate()?;
-        let name = new_profile.profile_name.clone();
+        let name = new_profile.name().to_string();
         if self.profiles.profiles.contains_key(&name) {
-            return Err(anyhow!("a profile named '{}' already exists", name));
+            return Err(anyhow!("a profile named '{name}' already exists"));
+        }
+        // For Assume Role profiles, the source profile must already exist —
+        // otherwise the credential_process chain has nothing to assume from.
+        if let NewProfile::Assume(p) = &new_profile {
+            if !self.profiles.profiles.contains_key(&p.source_profile) {
+                return Err(anyhow!(
+                    "source profile '{}' does not exist — add it first",
+                    p.source_profile
+                ));
+            }
         }
         let mut profiles = self.profiles.clone();
         profiles
             .profiles
-            .insert(name.clone(), Profile::SsoProfile(new_profile));
+            .insert(name.clone(), new_profile.into_profile());
         save_profiles_to_file(&profiles)?;
         write_profile_to_aws_config(&name)?;
         Ok(name)
@@ -438,16 +595,50 @@ fn render_add(app: &mut App, f: &mut Frame) {
         .constraints([Constraint::Min(3), Constraint::Length(3)].as_ref())
         .split(f.area());
 
-    let mut lines: Vec<Line> = Vec::with_capacity(FIELD_LABELS.len() + 2);
+    let labels = app.form.field_labels();
+    let mut lines: Vec<Line> = Vec::with_capacity(labels.len() + 3);
     lines.push(Line::from(""));
-    for (i, label) in FIELD_LABELS.iter().enumerate() {
-        let value = &app.form.fields[i];
-        let display = if i == app.form.focused {
+
+    // Type-toggle slot.
+    let type_focused = app.form.focused == 0;
+    let kind_label = app.form.kind.label();
+    let kind_display = if type_focused {
+        format!("‹ {kind_label} ›")
+    } else {
+        kind_label.to_string()
+    };
+    let type_label_style = if type_focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {:<18} ", "Profile type"), type_label_style),
+        Span::styled(
+            kind_display,
+            if type_focused {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    // Field slots for the active kind.
+    for (i, label) in labels.iter().enumerate() {
+        let value = app.form.focused_field_value(i);
+        let is_focused = app.form.focused == i + 1;
+        let display = if is_focused {
             format!("{value}█")
         } else {
-            value.clone()
+            value.to_string()
         };
-        let label_style = if i == app.form.focused {
+        let label_style = if is_focused {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
@@ -459,6 +650,7 @@ fn render_add(app: &mut App, f: &mut Frame) {
             Span::raw(display),
         ]));
     }
+
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
@@ -468,6 +660,11 @@ fn render_add(app: &mut App, f: &mut Frame) {
         chunks[0],
     );
 
+    let default_help = if type_focused {
+        "[← →] toggle type  [Tab / ↑↓] next field  [Enter] save  [Esc] cancel"
+    } else {
+        "[Tab / ↑↓] field  [Enter] save  [Esc] cancel"
+    };
     let help = match &app.status {
         Some((m, true)) => Line::from(Span::styled(
             format!("✗ {m}"),
@@ -477,7 +674,7 @@ fn render_add(app: &mut App, f: &mut Frame) {
             format!("✓ {m}"),
             Style::default().fg(Color::Green),
         )),
-        None => Line::from("[Tab / ↑↓] field  [Enter] save  [Esc] cancel"),
+        None => Line::from(default_help),
     };
     f.render_widget(
         Paragraph::new(help).block(Block::default().borders(Borders::ALL).title(" help ")),
