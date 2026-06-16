@@ -2,14 +2,14 @@ use crate::aws_credentials::AWScredentials;
 use crate::constants::{PROFILES, PROGRAM_FOLDER};
 use crate::file_helper::{
     backup_config, get_aws_config, get_exe_path, get_home_os_string, restrict_file_permissions,
+    write_atomic,
 };
 use anyhow::{anyhow, Result};
 use ini::Ini;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Profiles {
@@ -40,6 +40,11 @@ pub struct AssumeSsoProfile {
     pub profile_name: String,
     pub role_arn: String,
     pub region: String,
+    // Optional STS AssumeRole session duration. Unlike SSO get_role_credentials
+    // (whose duration is fixed by the permission set), the STS AssumeRole call
+    // honors a requested duration, so this is wired through to it.
+    #[serde(default)]
+    pub duration_seconds: Option<i32>,
 }
 
 impl Profiles {
@@ -109,14 +114,6 @@ impl Profiles {
                                 return Err(anyhow!("sso_role_name not in profile"));
                             }
                         };
-                        // let region = match profile.get("region") {
-                        //     Some(region) => region.to_string(),
-                        //     None => {
-                        //         error!("aws_profiles.Profiles.from_existing_config region not in profile");
-                        //         return Err(anyhow!("region not in profile"));
-                        //     }
-                        // };
-
                         let duration_seconds: Option<u16> = match profile.get("duration_seconds") {
                             Some(duration_seconds) => match duration_seconds.to_string().parse() {
                                 Ok(duration_seconds) => Some(duration_seconds),
@@ -128,7 +125,10 @@ impl Profiles {
                             None => None,
                         };
                         debug!("Inserting {}", profile_name);
-                        let key: String = profile_name.replace("profile ", "");
+                        let key: String = profile_name
+                            .strip_prefix("profile ")
+                            .unwrap_or(profile_name)
+                            .to_string();
                         profiles.insert(
                             key.clone(),
                             Profile::SsoProfile(SsoProfile {
@@ -168,7 +168,20 @@ impl Profiles {
                                 return Err(anyhow!("region not in profile"));
                             }
                         };
-                        let key: String = profile_name.replace("profile ", "");
+                        let duration_seconds: Option<i32> = match profile.get("duration_seconds") {
+                            Some(d) => match d.parse() {
+                                Ok(d) => Some(d),
+                                Err(_) => {
+                                    error!("aws_profiles.Profiles.from_existing_config duration_seconds not a number");
+                                    return Err(anyhow!("duration_seconds is not a valid integer"));
+                                }
+                            },
+                            None => None,
+                        };
+                        let key: String = profile_name
+                            .strip_prefix("profile ")
+                            .unwrap_or(profile_name)
+                            .to_string();
                         debug!("Inserting {}", profile_name);
                         profiles.insert(
                             key.clone(),
@@ -177,7 +190,18 @@ impl Profiles {
                                 source_profile,
                                 role_arn,
                                 region,
+                                duration_seconds,
                             }),
+                        );
+                    } else if profile.contains_key("source_profile")
+                        && profile.contains_key("role_arn")
+                    {
+                        // Looks like an assume-role profile but is missing the
+                        // required `region` key — warn rather than dropping it
+                        // silently, since the omission is almost always a typo.
+                        warn!(
+                            "aws_profiles.Profiles.from_existing_config: profile {:?} has source_profile and role_arn but no 'region'; skipping",
+                            profile_name
                         );
                     };
                 }
@@ -187,53 +211,6 @@ impl Profiles {
             }
         }
         Ok(Profiles { profiles })
-    }
-
-    pub fn from_url(&self, url: &str) -> Option<&Profile> {
-        info!("Searching first found profile for url");
-        for (_, profile) in self.profiles.iter() {
-            match profile {
-                Profile::SsoProfile(sso_profile) => {
-                    if sso_profile.sso_start_url == *url {
-                        return Some(profile);
-                    }
-                }
-                Profile::AssumeSsoProfile(_) => {}
-                _ => {
-                    error!("aws_profiles.Profiles.from_url profile not found");
-                }
-            }
-        }
-        None
-    }
-
-    pub fn to_file(&self) -> Result<()> {
-        info!("Writing profiles to my own managed file");
-        let profile_json = get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, PROFILES).as_str())?;
-        restrict_file_permissions(&profile_json)?;
-        let mut file = match File::create(profile_json.clone()) {
-            Ok(file) => file,
-            Err(e) => {
-                error!("aws_profiles.Profiles.to_file {:?}", e);
-                return Err(anyhow!("Error creating profile file"));
-            }
-        };
-        let data: String = match serde_json::to_string(self) {
-            Ok(data) => data,
-            Err(e) => {
-                error!("aws_profiles.Profiles.to_file {:?}", e);
-                return Err(anyhow!("Error serializing profile"));
-            }
-        };
-        match file.write_all(data.as_bytes()) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("aws_profiles.Profiles.to_file {:?}", e);
-                return Err(anyhow!("Error writing to profile file"));
-            }
-        };
-        restrict_file_permissions(&profile_json)?;
-        Ok(())
     }
 
     pub fn from_file() -> Result<Profiles> {
@@ -255,16 +232,6 @@ impl Profiles {
         let existing_profiles = Profiles::from_existing_config()?;
 
         let profile_json = get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, PROFILES).as_str())?;
-        let _ = File::create(&profile_json)?;
-
-        let mut file = match File::create(&profile_json) {
-            Ok(file) => file,
-            Err(e) => {
-                error!("aws_profiles.Profiles.setup_file {:?}", e);
-                return Err(anyhow!("Error creating profile file"));
-            }
-        };
-        restrict_file_permissions(&profile_json)?;
         let data: String = match serde_json::to_string(&existing_profiles) {
             Ok(data) => data,
             Err(e) => {
@@ -272,13 +239,7 @@ impl Profiles {
                 return Err(anyhow!("Error serializing profile file"));
             }
         };
-        match file.write_all(data.as_bytes()) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("aws_profiles.Profiles.setup_file {:?}", e);
-                return Err(anyhow!("Error writing to profile file"));
-            }
-        };
+        write_atomic(profile_json.as_os_str(), data.as_bytes())?;
 
         let exe_path_os_str = get_exe_path()?;
         let exe_path = match exe_path_os_str.as_os_str().to_str() {
@@ -323,14 +284,17 @@ impl Profiles {
                     }
                 };
             }
+            // Quote the exe path: the AWS CLI shlex-splits credential_process, so
+            // a path containing spaces would be parsed as multiple arguments.
             let credential_process =
-                format!(r#"{exe_path} token {args}"#, args = common_args.join(" "));
+                format!(r#""{exe_path}" token {args}"#, args = common_args.join(" "));
             conf.with_section(Some(&ini_profile))
                 .set("credential_process", credential_process.as_str())
                 .set("output", "json");
         }
-        // debug!("{:?}", conf);
-        conf.write_to_file(aws_config.as_os_str())?;
+        let mut buf = Vec::new();
+        conf.write_to(&mut buf)?;
+        write_atomic(aws_config.as_os_str(), &buf)?;
         Ok(())
     }
 }
@@ -347,7 +311,7 @@ impl SsoProfile {
     pub async fn get_token(&self) -> Result<String> {
         info!("get SsoProfile token");
         let credentials = AWScredentials::get_role_credentials(self.clone()).await?;
-        Ok(serde_json::to_string(&credentials)?)
+        credentials.as_json()
     }
     pub async fn get_credentials(&self) -> Result<AWScredentials> {
         info!("get SsoProfile credentials");
@@ -382,7 +346,7 @@ impl AssumeSsoProfile {
         info!("get AssumeSsoProfile token");
         let sso_profile = self.get_sso_profile()?;
         let credentials = AWScredentials::get_assume_role(self.clone(), sso_profile).await?;
-        Ok(serde_json::to_string(&credentials)?)
+        credentials.as_json()
     }
     pub async fn get_credentials(&self) -> Result<AWScredentials> {
         info!("get AssumeSsoProfile token");
@@ -428,6 +392,7 @@ mod tests {
             profile_name: name.to_string(),
             role_arn: "arn:aws:iam::123456789012:role/MyRole".to_string(),
             region: "us-east-1".to_string(),
+            duration_seconds: Some(3600),
         }
     }
 
@@ -449,50 +414,6 @@ mod tests {
             Profile::AssumeSsoProfile(make_assume_profile("assume-prod")),
         );
         Profiles { profiles }
-    }
-
-    // --- from_url() ---
-
-    #[test]
-    fn test_from_url_matching() {
-        let profiles = make_profiles();
-        let result = profiles.from_url("https://my-sso.awsapps.com/start");
-        assert!(result.is_some());
-        match result.unwrap() {
-            Profile::SsoProfile(p) => assert_eq!(p.profile_name, "dev"),
-            _ => panic!("expected SsoProfile"),
-        }
-    }
-
-    #[test]
-    fn test_from_url_unknown_returns_none() {
-        let profiles = make_profiles();
-        let result = profiles.from_url("https://unknown.awsapps.com/start");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_from_url_empty_profiles() {
-        let profiles = Profiles {
-            profiles: HashMap::new(),
-        };
-        assert!(profiles
-            .from_url("https://my-sso.awsapps.com/start")
-            .is_none());
-    }
-
-    #[test]
-    fn test_from_url_ignores_assume_profiles() {
-        // Create profiles with only an assume profile
-        let mut map = HashMap::new();
-        map.insert(
-            "assume-prod".to_string(),
-            Profile::AssumeSsoProfile(make_assume_profile("assume-prod")),
-        );
-        let profiles = Profiles { profiles: map };
-        assert!(profiles
-            .from_url("arn:aws:iam::123456789012:role/MyRole")
-            .is_none());
     }
 
     // --- Serde round-trips ---
@@ -528,6 +449,16 @@ mod tests {
         assert_eq!(deser.source_profile, "dev");
         assert_eq!(deser.role_arn, "arn:aws:iam::123456789012:role/MyRole");
         assert_eq!(deser.region, "us-east-1");
+        assert_eq!(deser.duration_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_assume_sso_profile_deserialize_without_duration() {
+        // Older profiles.json predates duration_seconds; #[serde(default)] must
+        // let it deserialize to None rather than erroring.
+        let json = r#"{"source_profile":"dev","profile_name":"p","role_arn":"arn:aws:iam::1:role/r","region":"us-east-1"}"#;
+        let p: AssumeSsoProfile = serde_json::from_str(json).unwrap();
+        assert!(p.duration_seconds.is_none());
     }
 
     #[test]

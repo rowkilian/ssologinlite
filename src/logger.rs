@@ -20,6 +20,19 @@ pub fn logger(level: &str) -> Result<()> {
     };
 
     let log_file = get_home_os_string(format!("{PROGRAM_FOLDER}/logs/ssologinlite.log",).as_str())?;
+
+    // log4rs creates log files at the process umask (typically 0o644). Logs may
+    // contain diagnostic data, so lock the logs directory to 0o700 — that
+    // denies other local users access regardless of the individual file modes.
+    if let Some(parent) = std::path::Path::new(&log_file).parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
     let log_file_pattern_str =
         get_home_os_string(format!("{PROGRAM_FOLDER}/logs/ssologinlite_{{}}.log",).as_str())?;
     let log_file_pattern = match log_file_pattern_str.as_os_str().to_str() {

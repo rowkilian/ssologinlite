@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand};
-// use clap_builder::derive::Parser;
 /// Oidc helper for aws sso login
 /// sets itself up in the aws config file as credential_process
 
@@ -24,6 +23,14 @@ pub enum Commands {
     Token(TokenArgs),
     /// Gets EKS auth token.
     Eks(EksArgs),
+    /// Print an ECR registry login password (like `aws ecr get-login-password`).
+    Ecr(EcrArgs),
+    /// Generate an RDS IAM database auth token (like `aws rds generate-db-auth-token`).
+    Rds(RdsArgs),
+    /// Get a CodeArtifact authorization token.
+    CodeArtifact(CodeArtifactArgs),
+    /// Get temporary Redshift cluster credentials (JSON).
+    Redshift(RedshiftArgs),
     /// Time left before the next sso login.
     SSOExpiration,
     /// Exit code 0 if sso login is required.
@@ -50,6 +57,76 @@ pub struct EksArgs {
     /// Cluster name
     #[arg(short('c'), long)]
     pub cluster: Option<String>,
+}
+
+#[derive(Args)]
+pub struct EcrArgs {
+    /// Profile to authenticate with
+    #[arg(short('p'), long)]
+    pub profile: String,
+    /// Registry region (defaults to the profile's region)
+    #[arg(short('r'), long)]
+    pub region: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RdsArgs {
+    /// Profile to authenticate with
+    #[arg(short('p'), long)]
+    pub profile: String,
+    /// Database endpoint host
+    #[arg(short('H'), long)]
+    pub host: String,
+    /// Database port
+    #[arg(short('P'), long, default_value_t = 5432)]
+    pub port: u16,
+    /// Database user to connect as
+    #[arg(short('u'), long)]
+    pub db_user: String,
+    /// Region (defaults to the profile's region)
+    #[arg(short('r'), long)]
+    pub region: Option<String>,
+}
+
+#[derive(Args)]
+pub struct CodeArtifactArgs {
+    /// Profile to authenticate with
+    #[arg(short('p'), long)]
+    pub profile: String,
+    /// CodeArtifact domain
+    #[arg(short('d'), long)]
+    pub domain: String,
+    /// Domain owner account ID
+    #[arg(short('o'), long)]
+    pub domain_owner: String,
+    /// Token lifetime in seconds
+    #[arg(long)]
+    pub duration_seconds: Option<i64>,
+    /// Region (defaults to the profile's region)
+    #[arg(short('r'), long)]
+    pub region: Option<String>,
+}
+
+#[derive(Args)]
+pub struct RedshiftArgs {
+    /// Profile to authenticate with
+    #[arg(short('p'), long)]
+    pub profile: String,
+    /// Cluster identifier
+    #[arg(short('c'), long)]
+    pub cluster_id: String,
+    /// Database user to connect as
+    #[arg(short('u'), long)]
+    pub db_user: String,
+    /// Database name
+    #[arg(short('n'), long)]
+    pub db_name: Option<String>,
+    /// Create the DB user if it does not exist
+    #[arg(long, default_value_t = false)]
+    pub auto_create: bool,
+    /// Region (defaults to the profile's region)
+    #[arg(short('r'), long)]
+    pub region: Option<String>,
 }
 
 #[cfg(test)]
@@ -106,6 +183,95 @@ mod tests {
                 assert_eq!(args.cluster.as_deref(), Some("my-cluster"));
             }
             _ => panic!("expected Eks"),
+        }
+    }
+
+    #[test]
+    fn test_ecr_subcommand() {
+        let cli =
+            Cli::try_parse_from(["ssologinlite", "ecr", "-p", "prod", "-r", "us-west-2"]).unwrap();
+        match cli.command {
+            Commands::Ecr(args) => {
+                assert_eq!(args.profile, "prod");
+                assert_eq!(args.region.as_deref(), Some("us-west-2"));
+            }
+            _ => panic!("expected Ecr"),
+        }
+    }
+
+    #[test]
+    fn test_rds_subcommand_defaults_port() {
+        let cli = Cli::try_parse_from([
+            "ssologinlite",
+            "rds",
+            "-p",
+            "prod",
+            "-H",
+            "db.example.com",
+            "-u",
+            "appuser",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Rds(args) => {
+                assert_eq!(args.profile, "prod");
+                assert_eq!(args.host, "db.example.com");
+                assert_eq!(args.port, 5432);
+                assert_eq!(args.db_user, "appuser");
+            }
+            _ => panic!("expected Rds"),
+        }
+    }
+
+    #[test]
+    fn test_rds_missing_host_errors() {
+        let result = Cli::try_parse_from(["ssologinlite", "rds", "-p", "prod", "-u", "u"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_codeartifact_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ssologinlite",
+            "code-artifact",
+            "-p",
+            "prod",
+            "-d",
+            "mydomain",
+            "-o",
+            "123456789012",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::CodeArtifact(args) => {
+                assert_eq!(args.domain, "mydomain");
+                assert_eq!(args.domain_owner, "123456789012");
+                assert!(args.duration_seconds.is_none());
+            }
+            _ => panic!("expected CodeArtifact"),
+        }
+    }
+
+    #[test]
+    fn test_redshift_subcommand() {
+        let cli = Cli::try_parse_from([
+            "ssologinlite",
+            "redshift",
+            "-p",
+            "prod",
+            "-c",
+            "my-cluster",
+            "-u",
+            "appuser",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Redshift(args) => {
+                assert_eq!(args.cluster_id, "my-cluster");
+                assert_eq!(args.db_user, "appuser");
+                assert!(!args.auto_create);
+            }
+            _ => panic!("expected Redshift"),
         }
     }
 

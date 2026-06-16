@@ -1,9 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Local;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,9 +21,7 @@ use std::time::Duration;
 use crate::aws_profile::{AssumeSsoProfile, Profile, Profiles, SsoProfile};
 use crate::config::ProgramConfig;
 use crate::constants::{CONFIG_FILE, PROFILES, PROGRAM_FOLDER};
-use crate::file_helper::{
-    get_aws_config, get_exe_path, get_home_os_string, restrict_file_permissions,
-};
+use crate::file_helper::{get_aws_config, get_exe_path, get_home_os_string, write_atomic};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -40,7 +35,13 @@ const SSO_FIELD_LABELS: [&str; 7] = [
     "Duration (sec)",
 ];
 
-const ASSUME_FIELD_LABELS: [&str; 4] = ["Profile name", "Source profile", "Role ARN", "Region"];
+const ASSUME_FIELD_LABELS: [&str; 5] = [
+    "Profile name",
+    "Source profile",
+    "Role ARN",
+    "Region",
+    "Duration (sec)",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProfileKind {
@@ -113,14 +114,14 @@ struct AddForm {
     mode: FormMode,
     kind: ProfileKind,
     sso_values: [String; 7],
-    assume_values: [String; 4],
+    assume_values: [String; 5],
     focused: usize,
     available_sources: Vec<String>,
 }
 
 impl AddForm {
     fn new(available_sources: Vec<String>) -> Self {
-        let mut assume_values: [String; 4] = Default::default();
+        let mut assume_values: [String; 5] = Default::default();
         if let Some(first) = available_sources.first() {
             assume_values[ASSUME_SOURCE_FIELD] = first.clone();
         }
@@ -157,11 +158,14 @@ impl AddForm {
                 (ProfileKind::Sso, values, Default::default())
             }
             Profile::AssumeSsoProfile(p) => {
-                let values: [String; 4] = [
+                let values: [String; 5] = [
                     p.profile_name.clone(),
                     p.source_profile.clone(),
                     p.role_arn.clone(),
                     p.region.clone(),
+                    p.duration_seconds
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
                 ];
                 (ProfileKind::AssumeSso, Default::default(), values)
             }
@@ -326,6 +330,7 @@ impl AddForm {
         let source = self.assume_values[ASSUME_SOURCE_FIELD].trim();
         let arn = self.assume_values[2].trim();
         let region = self.assume_values[3].trim();
+        let duration = self.assume_values[4].trim();
 
         if name.is_empty() {
             return Err(anyhow!("Profile name is required"));
@@ -349,12 +354,22 @@ impl AddForm {
         if region.is_empty() {
             return Err(anyhow!("Region is required"));
         }
+        let duration_seconds = if duration.is_empty() {
+            None
+        } else {
+            Some(
+                duration
+                    .parse::<i32>()
+                    .map_err(|_| anyhow!("Duration must be a positive integer"))?,
+            )
+        };
 
         Ok(AssumeSsoProfile {
             profile_name: name.to_string(),
             source_profile: source.to_string(),
             role_arn: arn.to_string(),
             region: region.to_string(),
+            duration_seconds,
         })
     }
 }
@@ -505,6 +520,8 @@ impl App {
             return Ok(false);
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            // Don't orphan a running test subprocess when quitting via Ctrl-C.
+            self.kill_running_test();
             return Ok(true);
         }
         // Status messages clear on the next key press from the same screen, except
@@ -789,11 +806,7 @@ impl App {
                 // While the subprocess is still running, kill it before
                 // navigating away. Reader threads will exit naturally as the
                 // pipes close.
-                if let Screen::Test(run) = &mut self.screen {
-                    if let Some(child) = run.child.as_mut() {
-                        let _ = child.kill();
-                    }
-                }
+                self.kill_running_test();
                 self.screen = Screen::List;
             }
             KeyCode::Enter if !running => self.screen = Screen::List,
@@ -831,6 +844,16 @@ impl App {
 
     fn is_test_running(&self) -> bool {
         matches!(&self.screen, Screen::Test(r) if r.finished.is_none())
+    }
+
+    // Kill the test subprocess if one is on-screen and still running. Reader
+    // threads exit naturally once the pipes close. No-op on any other screen.
+    fn kill_running_test(&mut self) {
+        if let Screen::Test(run) = &mut self.screen {
+            if let Some(child) = run.child.as_mut() {
+                let _ = child.kill();
+            }
+        }
     }
 
     fn save_form(&mut self) -> Result<String> {
@@ -1346,10 +1369,15 @@ fn sso_profile_lines(p: &SsoProfile) -> Vec<Line<'static>> {
         kv_line("Account ID", &p.sso_account_id),
         kv_line("Role name", &p.sso_role_name),
         kv_line("Default region", p.region.as_deref().unwrap_or("(none)")),
+        // SSO get_role_credentials has no duration parameter — the session
+        // length is fixed by the permission set — so anything set here is
+        // informational only. (Assume-role profiles do honor their duration.)
         kv_line(
             "Duration",
             &p.duration_seconds
-                .map_or("(default)".to_string(), |d| format!("{d} seconds")),
+                .map_or("(set by permission set)".to_string(), |d| {
+                    format!("{d}s (informational — SSO ignores)")
+                }),
         ),
     ]
 }
@@ -1361,6 +1389,11 @@ fn assume_profile_lines(p: &AssumeSsoProfile) -> Vec<Line<'static>> {
         kv_line("Source profile", &p.source_profile),
         kv_line("Role ARN", &p.role_arn),
         kv_line("Region", &p.region),
+        kv_line(
+            "Duration",
+            &p.duration_seconds
+                .map_or("(default)".to_string(), |d| format!("{d} seconds")),
+        ),
     ]
 }
 
@@ -1383,12 +1416,28 @@ fn kv_line(key: &str, value: &str) -> Line<'static> {
 
 fn save_profiles_to_file(profiles: &Profiles) -> Result<()> {
     let path = get_home_os_string(format!("{PROGRAM_FOLDER}/{PROFILES}").as_str())?;
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(profiles)?;
-    std::fs::write(&path, json)?;
-    let _ = restrict_file_permissions(&path);
+    // Atomic + 0o600; write_atomic creates the parent dir and chmods.
+    write_atomic(path.as_os_str(), json.as_bytes())?;
+    Ok(())
+}
+
+// Load ~/.aws/config, returning an empty Ini only when the file is absent. If
+// the file exists but cannot be parsed, error out — defaulting to empty here
+// would discard every other profile on the next write_to.
+fn load_aws_config_or_empty(path: &std::ffi::OsString) -> Result<Ini> {
+    if !std::path::Path::new(path).exists() {
+        return Ok(Ini::new());
+    }
+    Ini::load_from_file(path.as_os_str())
+        .map_err(|e| anyhow!("could not parse {}: {e}", path.to_string_lossy()))
+}
+
+// Serialise an Ini and write it atomically with 0o600 permissions.
+fn write_ini_atomic(conf: &Ini, path: &std::ffi::OsStr) -> Result<()> {
+    let mut buf = Vec::new();
+    conf.write_to(&mut buf)?;
+    write_atomic(path, &buf)?;
     Ok(())
 }
 
@@ -1399,20 +1448,19 @@ fn write_profile_to_aws_config(profile_name: &str) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("exe path is not valid UTF-8"))?;
 
-    if let Some(parent) = std::path::Path::new(&aws_config).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut conf = Ini::load_from_file(aws_config.as_os_str()).unwrap_or_default();
+    let mut conf = load_aws_config_or_empty(&aws_config)?;
     let section = if profile_name == "default" {
         "default".to_string()
     } else {
         format!("profile {profile_name}")
     };
-    let credential_process = format!("{exe_path} token --profile {profile_name}");
+    // Quote the exe path: the AWS CLI shlex-splits credential_process, so a path
+    // containing spaces would otherwise be parsed as multiple arguments.
+    let credential_process = format!("\"{exe_path}\" token --profile {profile_name}");
     conf.with_section(Some(&section))
         .set("credential_process", credential_process.as_str())
         .set("output", "json");
-    conf.write_to_file(aws_config.as_os_str())?;
+    write_ini_atomic(&conf, aws_config.as_os_str())?;
     Ok(())
 }
 
@@ -1432,11 +1480,8 @@ fn read_program_config_toml() -> Result<ProgramConfig> {
 
 fn write_program_config_toml(cfg: &ProgramConfig) -> Result<()> {
     let path = config_toml_path()?;
-    if let Some(parent) = std::path::Path::new(&path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let serialised = toml::to_string_pretty(cfg)?;
-    std::fs::write(&path, serialised)?;
+    write_atomic(path.as_os_str(), serialised.as_bytes())?;
     Ok(())
 }
 
@@ -1461,9 +1506,6 @@ fn export_aws_config(profiles: &Profiles) -> Result<std::path::PathBuf> {
     let path_os =
         get_home_os_string(format!("{PROGRAM_FOLDER}/config.exported.{timestamp}").as_str())?;
     let path = std::path::PathBuf::from(&path_os);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
 
     let mut conf = Ini::new();
     // Sort by name so re-running export with the same profile set gives
@@ -1508,8 +1550,7 @@ fn export_aws_config(profiles: &Profiles) -> Result<std::path::PathBuf> {
         }
     }
 
-    conf.write_to_file(&path)?;
-    let _ = restrict_file_permissions(&path_os);
+    write_ini_atomic(&conf, path_os.as_os_str())?;
     Ok(path)
 }
 
@@ -1525,7 +1566,7 @@ fn remove_profile_from_aws_config(profile_name: &str) -> Result<()> {
         format!("profile {profile_name}")
     };
     conf.delete(Some(section.as_str()));
-    conf.write_to_file(aws_config.as_os_str())?;
+    write_ini_atomic(&conf, aws_config.as_os_str())?;
     Ok(())
 }
 
@@ -1534,17 +1575,16 @@ fn remove_profile_from_aws_config(profile_name: &str) -> Result<()> {
 fn setup_tui() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture is intentionally NOT enabled: it would intercept the
+    // terminal's native click-drag selection, preventing the user from copying
+    // the URLs/ARNs shown in the detail and test panes.
+    execute!(stdout, EnterAlternateScreen)?;
     Terminal::new(CrosstermBackend::new(stdout)).map_err(Into::into)
 }
 
 fn teardown_tui(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }

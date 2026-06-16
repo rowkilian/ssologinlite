@@ -29,27 +29,15 @@ pub fn open_url(config: ProgramConfig, url: String) -> Result<()> {
                 Err(anyhow!("mywebbrowser.open_url browser failed {:?}", e))
             }
         },
+        // A configurable "launch arbitrary command as the browser" option was
+        // considered and deliberately rejected: it would let the config file
+        // turn into an arbitrary-command-execution vector.
         _ => match open_browser(Browser::Default, url.as_str()) {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!("mywebbrowser.open_url: {}", e);
                 Err(anyhow!("mywebbrowser.open_url browser failed {:?}", e))
             }
-        }, //
-           // There was a thought of having a command in the config to launch any
-           // browser but thinking about it, it feels like a security risk.
-           // Some(value) => {
-           //     let cmd = format!("{} {}", value, url);
-           //     let output = std::process::Command::new("sh")
-           //         .arg("-c")
-           //         .arg(cmd)
-           //         .output()?;
-           //     if !output.status.success() {
-           //         let msg = format!("Error opening browser: {:?}", output);
-           //         error!("{}", msg);
-           //         return Err(anyhow!(msg));
-           //     }
-           //     Ok(())
-           // }
+        },
     }
 }

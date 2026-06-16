@@ -1,23 +1,17 @@
 use crate::aws_credentials::AWScredentials;
+use crate::sigv4::{self, GetSignedUrlOptions, EMPTY_SHA256_HASH};
 use anyhow::Result;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Duration, Utc};
-use hmac::{Hmac, Mac};
-use log::debug;
+use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use url_search_params::encode_uri_component;
 
-const AUTH_SERVICE: &str = "sts";
 const AUTH_COMMAND: &str = "GetCallerIdentity";
 const AUTH_API_VERSION: &str = "2011-06-15";
 const BETA_API: &str = "client.authentication.k8s.io/v1beta1";
-const URL_TIMEOUT: u16 = 60;
 const TOKEN_EXPIRATION_MINS: i64 = 14;
 const TOKEN_PREFIX: &str = "k8s-aws-v1.";
 const K8S_AWS_ID_HEADER: &str = "x-k8s-aws-id";
-const EMPTY_SHA256_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[allow(non_snake_case)]
@@ -56,7 +50,7 @@ impl Status {
     pub fn from_credentials(
         credentials: AWScredentials,
         region: String,
-        cluster: &String,
+        cluster: &str,
     ) -> Result<Status> {
         let signed_url = GetSignedUrlOptions::new(
             region,
@@ -86,7 +80,7 @@ impl EksToken {
     pub fn from_credentials(
         credentials: AWScredentials,
         region: String,
-        cluster: &String,
+        cluster: &str,
     ) -> Result<String> {
         let status = Status::from_credentials(credentials, region, cluster)?;
         let token = EksToken {
@@ -96,171 +90,43 @@ impl EksToken {
         let mut buf = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
         let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        token.serialize(&mut ser).unwrap();
+        token.serialize(&mut ser)?;
         Ok(String::from_utf8(buf)?)
     }
 }
 
-#[derive(Debug)]
-pub struct GetSignedUrlOptions {
-    pub method: String,
-    pub region: String,
-    pub expires_in: u16,
-    pub date: DateTime<Utc>,
-    pub service: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub security_token: String,
-    pub endpoint: String,
+// EKS sends the GetCallerIdentity request signing host + the x-k8s-aws-id
+// header (which carries the cluster name), so both the query set and canonical
+// request below are STS/EKS-specific; the generic SigV4 mechanics live in sigv4.
+fn signed_headers() -> String {
+    format!("host;{K8S_AWS_ID_HEADER}")
 }
 
-impl Default for GetSignedUrlOptions {
-    fn default() -> GetSignedUrlOptions {
-        GetSignedUrlOptions {
-            method: String::from("GET"),
-            region: String::from("us-east-1"),
-            expires_in: URL_TIMEOUT,
-            date: Utc::now(),
-            service: String::from(AUTH_SERVICE),
-            access_key_id: String::from("ASIAIOSFODNN7EXAMPLE"),
-            secret_access_key: String::from("wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY"),
-            security_token: String::from(
-                "AQoEXAMPLEH4aoAH0gNCAPyJxz4BlCFFxWNE1OPTgk5TthT+FvwqnKwRcOIfrRh3c/L\
-                To6UDdyJwOOvEVPvLXCrrrUtdnniCEXAMPLE/IvU1dYUg2RVAJBanLiHb4IgRmpRV3z\
-                rkuWJOgQs8IZZaIv2BXIa2R4OlgkBN9bkUDNCJiBeb/AXlzBBko7b15fjrBs2+cTQtp\
-                Z3CYWFXG8C5zqx37wnOE49mRl/+OtkIKGO7fAE",
-            ),
-            endpoint: String::from("amazonaws.com"),
-        }
-    }
-}
-
-impl GetSignedUrlOptions {
-    pub fn new(
-        region: String,
-        access_key_id: String,
-        secret_access_key: String,
-        security_token: String,
-    ) -> Self {
-        GetSignedUrlOptions {
-            method: String::from("GET"),
-            region,
-            expires_in: URL_TIMEOUT,
-            date: Utc::now(),
-            service: String::from(AUTH_SERVICE),
-            access_key_id,
-            secret_access_key,
-            security_token,
-            endpoint: String::from("amazonaws.com"),
-        }
-    }
-}
-
-fn sha256(data: &String) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("{:x}", hasher.finalize())
-}
-
-fn hmac_sha_256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
-    hasher.update(data);
-    hasher.finalize().into_bytes().to_vec()
-}
-
-fn hmac_sha_256_hex(key: &[u8], data: &str) -> String {
-    let mut hasher = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
-    hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize().into_bytes())
-}
-
-fn get_query_parameters(options: &GetSignedUrlOptions, for_canonical: bool) -> String {
-    let mut url_params: HashMap<String, String> = HashMap::new();
+fn get_query_parameters(options: &GetSignedUrlOptions) -> String {
+    let mut url_params: HashMap<String, String> =
+        sigv4::standard_query_params(options, &signed_headers());
     url_params.insert("Action".to_string(), AUTH_COMMAND.to_string());
     url_params.insert("Version".to_string(), AUTH_API_VERSION.to_string());
-    url_params.insert(
-        "X-Amz-Algorithm".to_string(),
-        "AWS4-HMAC-SHA256".to_string(),
-    );
-    url_params.insert(
-        "X-Amz-Credential".to_string(),
-        options.access_key_id.to_string()
-            + "/"
-            + &options.date.format("%Y%m%d").to_string()
-            + "/"
-            + &options.region
-            + "/"
-            + &options.service
-            + "/aws4_request",
-    );
-    url_params.insert(
-        "X-Amz-Date".to_string(),
-        options.date.format("%Y%m%dT%H%M%SZ").to_string(),
-    );
-    url_params.insert("X-Amz-Expires".to_string(), options.expires_in.to_string());
-    url_params.insert(
-        "X-Amz-SignedHeaders".to_string(),
-        format!("host;{K8S_AWS_ID_HEADER}").to_string(),
-    );
-    url_params.insert(
-        "X-Amz-Security-Token".to_string(),
-        options.security_token.to_string(),
-    );
-    build_url_search_params(url_params, for_canonical)
+    sigv4::build_url_search_params(url_params)
 }
 
 fn get_canonical_request(
     options: &GetSignedUrlOptions,
     query_parameters: &str,
-    cluster: &String,
+    cluster: &str,
 ) -> String {
-    let host =
-        &("host:".to_string() + &options.service + "." + &options.region + "." + &options.endpoint);
-    let cluster_header = format!("{}:{}", K8S_AWS_ID_HEADER, cluster);
-    let eks_payload = format!("host;{}", K8S_AWS_ID_HEADER);
-    let canonical_request: Vec<&str> = vec![
+    let host = format!(
+        "{}.{}.{}",
+        options.service, options.region, options.endpoint
+    );
+    sigv4::canonical_request(
         &options.method,
         "/",
         query_parameters,
-        host,
-        cluster_header.as_str(),
-        "",
-        eks_payload.as_str(),
+        &host,
+        &[(K8S_AWS_ID_HEADER, cluster)],
         EMPTY_SHA256_HASH,
-    ];
-    canonical_request.join("\n")
-}
-
-fn get_signature_payload(options: &GetSignedUrlOptions, payload: String) -> String {
-    let payload_hash = &sha256(&payload)[..];
-    let date1 = &options.date.format("%Y%m%dT%H%M%SZ").to_string()[..];
-    let date2 = &options.date.format("%Y%m%d").to_string()[..];
-    let third =
-        &(date2.to_owned() + "/" + &options.region + "/" + &options.service + "/aws4_request");
-
-    let signature_payload: Vec<&str> = vec!["AWS4-HMAC-SHA256", &date1, &third, payload_hash];
-    signature_payload.join("\n")
-}
-
-pub fn get_signature_key(options: &GetSignedUrlOptions) -> Vec<u8> {
-    let parts: Vec<String> = vec![
-        "AWS4".to_string() + &options.secret_access_key,
-        options.date.format("%Y%m%d").to_string(),
-        options.region.to_string(),
-        options.service.to_string(),
-        "aws4_request".to_string(),
-    ];
-
-    let bytes_vec: Vec<Vec<u8>> = parts
-        .into_iter()
-        .map(|s| s.into_bytes())
-        .collect::<Vec<Vec<u8>>>();
-
-    let vec_key: Vec<u8> = bytes_vec
-        .into_iter()
-        .reduce(|a, b| hmac_sha_256(&a, &b))
-        .unwrap();
-    vec_key
+    )
 }
 
 fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: String) -> String {
@@ -280,16 +146,20 @@ fn get_url(options: &GetSignedUrlOptions, query_parameters: String, signature: S
     url.join("")
 }
 
-pub fn get_signed_url(options: &GetSignedUrlOptions, cluster: &String) -> String {
-    let query_parameters_cr = get_query_parameters(options, true);
-    let query_parameters = get_query_parameters(options, false);
-    let canonical_request = get_canonical_request(options, &query_parameters_cr, cluster);
-    debug!("canonical_request = {}", canonical_request);
-    let signature_payload = get_signature_payload(options, canonical_request);
-    debug!("signature_payload = {}", signature_payload);
-    let signature_key = get_signature_key(options);
-    let signature = hmac_sha_256_hex(&signature_key, &signature_payload);
-    debug!("signature = {}", signature);
+pub fn get_signed_url(options: &GetSignedUrlOptions, cluster: &str) -> String {
+    // SigV4 signs the canonical (key-sorted) query string. The order of
+    // parameters in the final URL is irrelevant — AWS re-canonicalises the
+    // received query before verifying — so the same sorted string is reused
+    // for both the canonical request and the URL.
+    let query_parameters = get_query_parameters(options);
+    let canonical_request = get_canonical_request(options, &query_parameters, cluster);
+    // The canonical request and signature payload embed X-Amz-Security-Token
+    // (a live STS session token) and X-Amz-Credential. Logging them — even at
+    // debug — would leak a usable credential into the (non-0600) log file, so
+    // they are deliberately not logged here.
+    let signature_payload = sigv4::get_signature_payload(options, canonical_request);
+    let signature_key = sigv4::get_signature_key(options);
+    let signature = sigv4::hmac_sha_256_hex(&signature_key, &signature_payload);
 
     get_url(options, query_parameters, signature)
 }
@@ -298,63 +168,12 @@ fn base64url_encode(data: &str) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
-fn build_url_search_params(params: HashMap<String, String>, for_canonical: bool) -> String {
-    let mut key_value_list: Vec<String> = vec![];
-    for (key, value) in params {
-        let param = [
-            encode_uri_component(key.as_str()),
-            "=".to_string(),
-            encode_uri_component(value.as_str()),
-        ]
-        .join("");
-        key_value_list.push(param);
-    }
-
-    key_value_list.sort_by_key(|a| a.to_lowercase());
-    if !for_canonical {
-        (key_value_list[6], key_value_list[7]) =
-            (key_value_list[7].clone(), key_value_list[6].clone());
-    };
-    let url_search_params: String = key_value_list.join("&");
-
-    url_search_params
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_sha256_hash() {
-        let input = "test".to_string();
-        assert_eq!(
-            sha256(&input),
-            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-        );
-    }
-
-    #[test]
-    fn test_sha256_empty_string() {
-        let input = "".to_string();
-        assert_eq!(sha256(&input), EMPTY_SHA256_HASH);
-    }
-
-    #[test]
-    fn test_hmac_sha256_produces_correct_length() {
-        let key = b"key".to_vec();
-        let data = b"data".to_vec();
-        let result = hmac_sha_256(&key, &data);
-        assert_eq!(result.len(), 32); // SHA256 produces 32 bytes
-    }
-
-    #[test]
-    fn test_hmac_sha256_hex_format() {
-        let key = b"key".to_vec();
-        let data = "data".to_string();
-        let result = hmac_sha_256_hex(&key, &data);
-        assert_eq!(result.len(), 64); // Hex string is 2x byte length
-        assert!(result.chars().all(|c| c.is_ascii_hexdigit()));
-    }
+    // Primitive SigV4 tests (sha256/hmac/signature key & payload/param sort)
+    // now live in src/sigv4.rs alongside the functions they exercise.
 
     #[test]
     fn test_base64url_encode() {
@@ -387,9 +206,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_query_parameters_canonical() {
+    fn test_get_query_parameters() {
         let options = GetSignedUrlOptions::default();
-        let params = get_query_parameters(&options, true);
+        let params = get_query_parameters(&options);
 
         assert!(params.contains("Action=GetCallerIdentity"));
         assert!(params.contains("Version=2011-06-15"));
@@ -397,18 +216,24 @@ mod tests {
     }
 
     #[test]
-    fn test_get_query_parameters_non_canonical() {
+    fn test_get_query_parameters_sorted_case_insensitive() {
+        // The canonical query string must be sorted by key; verify the ordering
+        // the SigV4 signature depends on.
         let options = GetSignedUrlOptions::default();
-        let params = get_query_parameters(&options, false);
-
-        assert!(params.contains("Action=GetCallerIdentity"));
-        assert!(params.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        let params = get_query_parameters(&options);
+        let keys: Vec<&str> = params
+            .split('&')
+            .map(|kv| kv.split('=').next().unwrap())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_by_key(|k| k.to_lowercase());
+        assert_eq!(keys, sorted);
     }
 
     #[test]
     fn test_canonical_request_structure() {
         let options = GetSignedUrlOptions::default();
-        let params = get_query_parameters(&options, true);
+        let params = get_query_parameters(&options);
         let cluster = "test-cluster-123".to_string();
 
         let canonical = get_canonical_request(&options, &params, &cluster);
@@ -417,32 +242,6 @@ mod tests {
         assert!(canonical.contains("host:sts.us-east-1.amazonaws.com"));
         assert!(canonical.contains("x-k8s-aws-id:test-cluster-123"));
         assert!(canonical.contains(EMPTY_SHA256_HASH));
-    }
-
-    #[test]
-    fn test_signature_key_deterministic() {
-        let options = GetSignedUrlOptions::default();
-        let key1 = get_signature_key(&options);
-        let key2 = get_signature_key(&options);
-        assert_eq!(key1, key2);
-    }
-
-    #[test]
-    fn test_signature_key_length() {
-        let options = GetSignedUrlOptions::default();
-        let key = get_signature_key(&options);
-        assert_eq!(key.len(), 32); // HMAC-SHA256 produces 32 bytes
-    }
-
-    #[test]
-    fn test_signature_payload_format() {
-        let options = GetSignedUrlOptions::default();
-        let payload = "test payload".to_string();
-        let signature_payload = get_signature_payload(&options, payload);
-
-        assert!(signature_payload.starts_with("AWS4-HMAC-SHA256"));
-        assert!(signature_payload.contains("us-east-1"));
-        assert!(signature_payload.contains("sts"));
     }
 
     #[test]
@@ -465,8 +264,7 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let status =
-            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
+        let status = Status::from_credentials(creds, "us-west-2".to_string(), "my-cluster");
 
         assert!(status.is_ok());
         let status = status.unwrap();
@@ -485,8 +283,7 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
-        let token_json =
-            EksToken::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string());
+        let token_json = EksToken::from_credentials(creds, "us-west-2".to_string(), "my-cluster");
 
         assert!(token_json.is_ok());
         let token_json = token_json.unwrap();
@@ -514,8 +311,7 @@ mod tests {
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
         let status =
-            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
-                .unwrap();
+            Status::from_credentials(creds, "us-west-2".to_string(), "my-cluster").unwrap();
 
         // Parse as UTC DateTime
         let exp_time = chrono::NaiveDateTime::parse_from_str(
@@ -541,8 +337,7 @@ mod tests {
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
 
         let status =
-            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
-                .unwrap();
+            Status::from_credentials(creds, "us-west-2".to_string(), "my-cluster").unwrap();
 
         // Parse as UTC DateTime
         let exp_time = chrono::NaiveDateTime::parse_from_str(
@@ -593,22 +388,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_url_search_params_sorted() {
-        let mut params = HashMap::new();
-        params.insert("Zebra".to_string(), "last".to_string());
-        params.insert("Apple".to_string(), "first".to_string());
-        params.insert("Banana".to_string(), "second".to_string());
-
-        let result = build_url_search_params(params, true);
-        let parts: Vec<&str> = result.split('&').collect();
-
-        // Should be sorted (case-insensitive)
-        assert!(parts[0].starts_with("Apple"));
-        assert!(parts[1].starts_with("Banana"));
-        assert!(parts[2].starts_with("Zebra"));
-    }
-
-    #[test]
     fn test_token_round_trip_decodes_to_signed_url() {
         // Status::from_credentials produces a token of the form
         //   "k8s-aws-v1." + base64url(signed_url)
@@ -624,8 +403,7 @@ mod tests {
         }"#;
         let creds: AWScredentials = serde_json::from_str(creds_json).unwrap();
         let status =
-            Status::from_credentials(creds, "us-west-2".to_string(), &"my-cluster".to_string())
-                .unwrap();
+            Status::from_credentials(creds, "us-west-2".to_string(), "my-cluster").unwrap();
 
         let encoded = status
             .token

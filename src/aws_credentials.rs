@@ -25,6 +25,11 @@ pub struct AWScredentials {
     pub Expiration: String,
 }
 
+// Treat credentials as expired this many seconds before their real expiry, so
+// a token with only moments left isn't handed out and then rejected by AWS
+// mid-call.
+const EXPIRY_SKEW_SECS: i64 = 60;
+
 impl AWScredentials {
     fn is_expired(&self) -> bool {
         info!("Checking if credentials are expired");
@@ -40,7 +45,7 @@ impl AWScredentials {
             "aws_credentials.AWScredentials.isexpired.exp_dt: {:?}",
             exp_dt
         );
-        now > exp_dt
+        now + EXPIRY_SKEW_SECS * 1000 > exp_dt
     }
 
     // Cache-or-fetch helper. Looks up credentials by profile name in the local
@@ -138,7 +143,6 @@ impl AWScredentials {
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
             }
         };
-        // Ok(output) => match output.credentials {
         let string_access_key_id = match &credentials.access_key_id {
             Some(access_key) => access_key.to_owned(),
             None => {
@@ -217,6 +221,9 @@ impl AWScredentials {
             .assume_role()
             .set_role_session_name(Some(username))
             .set_role_arn(Some(assume_profile.role_arn))
+            // STS AssumeRole honors a requested session duration (SSO
+            // get_role_credentials does not); pass it through when set.
+            .set_duration_seconds(assume_profile.duration_seconds)
             .send()
             .await
         {
@@ -257,6 +264,20 @@ impl AWScredentials {
             SessionToken: credentials.session_token().to_string(),
             Expiration: string_expiration,
         })
+    }
+
+    // Build an SDK credentials provider from these resolved credentials, for
+    // constructing service clients (ECR, CodeArtifact, Redshift, ...). Same
+    // shape as the provider assembled inline in get_assume_role_from_aws.
+    pub fn credentials_provider(&self) -> SharedCredentialsProvider {
+        let creds = aws_sdk_sts::config::Credentials::new(
+            self.AccessKeyId.clone(),
+            self.SecretAccessKey.clone(),
+            Some(self.SessionToken.clone()),
+            None,
+            "ssologinlite",
+        );
+        SharedCredentialsProvider::new(creds)
     }
 
     pub fn as_json(&self) -> Result<String> {
