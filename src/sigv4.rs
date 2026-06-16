@@ -228,22 +228,28 @@ pub(crate) fn get_signature_key(options: &GetSignedUrlOptions) -> Vec<u8> {
         .unwrap()
 }
 
-// URI-encode and sort (case-insensitively) the query parameters into the
-// canonical `k=v&k=v` query string.
+// URI-encode and sort the query parameters into the canonical `k=v&k=v` query
+// string. SigV4 requires sorting by the encoded parameter name in byte order,
+// then by encoded value. Sorting the (key, value) tuple does exactly that;
+// sorting the joined "key=value" string would be subtly wrong when one key is a
+// prefix of another (the '=' separator, 0x3D, sorts after digits), and a
+// case-insensitive sort is not byte order at all.
 pub(crate) fn build_url_search_params(params: HashMap<String, String>) -> String {
-    let mut key_value_list: Vec<String> = vec![];
-    for (key, value) in params {
-        let param = [
-            encode_uri_component(key.as_str()),
-            "=".to_string(),
-            encode_uri_component(value.as_str()),
-        ]
-        .join("");
-        key_value_list.push(param);
-    }
-
-    key_value_list.sort_by_key(|a| a.to_lowercase());
-    key_value_list.join("&")
+    let mut pairs: Vec<(String, String)> = params
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                encode_uri_component(k.as_str()),
+                encode_uri_component(v.as_str()),
+            )
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 #[cfg(test)]
@@ -333,6 +339,18 @@ mod tests {
         assert!(parts[0].starts_with("Apple"));
         assert!(parts[1].starts_with("Banana"));
         assert!(parts[2].starts_with("Zebra"));
+    }
+
+    #[test]
+    fn test_build_url_search_params_is_byte_order_not_case_insensitive() {
+        // SigV4 sorts by byte order: uppercase (0x41..) precedes lowercase
+        // (0x61..), so "Zebra" must come before "apple". A case-insensitive
+        // sort would (wrongly) put "apple" first.
+        let mut params = HashMap::new();
+        params.insert("apple".to_string(), "1".to_string());
+        params.insert("Zebra".to_string(), "2".to_string());
+        let result = build_url_search_params(params);
+        assert_eq!(result, "Zebra=2&apple=1");
     }
 
     #[test]

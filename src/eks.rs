@@ -216,9 +216,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_query_parameters_sorted_case_insensitive() {
-        // The canonical query string must be sorted by key; verify the ordering
-        // the SigV4 signature depends on.
+    fn test_get_query_parameters_sorted_byte_order() {
+        // The canonical query string must be sorted by encoded key in byte
+        // order — the ordering the SigV4 signature depends on.
         let options = GetSignedUrlOptions::default();
         let params = get_query_parameters(&options);
         let keys: Vec<&str> = params
@@ -226,7 +226,7 @@ mod tests {
             .map(|kv| kv.split('=').next().unwrap())
             .collect();
         let mut sorted = keys.clone();
-        sorted.sort_by_key(|k| k.to_lowercase());
+        sorted.sort();
         assert_eq!(keys, sorted);
     }
 
