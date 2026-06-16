@@ -284,6 +284,30 @@ mod tests {
     }
 
     #[test]
+    fn test_signature_key_matches_aws_reference_vector() {
+        // Known-answer test against AWS's documented SigV4 "derive a signing
+        // key" example: secret + 20120215 / us-east-1 / iam must produce this
+        // exact key. Validates the HMAC chain cryptographically, not just its
+        // shape.
+        use chrono::TimeZone;
+        let options = GetSignedUrlOptions {
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            region: "us-east-1".to_string(),
+            service: "iam".to_string(),
+            date: Utc.with_ymd_and_hms(2012, 2, 15, 0, 0, 0).unwrap(),
+            ..Default::default()
+        };
+        let key_hex: String = get_signature_key(&options)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            key_hex,
+            "f4780e2d9f65fa895f9c67b32ce1baf0b0d8a43505a000a1a9e090d414db404d"
+        );
+    }
+
+    #[test]
     fn test_signature_key_length() {
         let options = GetSignedUrlOptions::default();
         assert_eq!(get_signature_key(&options).len(), 32);
