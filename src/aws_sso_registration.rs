@@ -20,7 +20,7 @@ pub struct SsoRegistration {
 
 impl SsoRegistration {
     pub async fn get(sso_region: &str) -> Result<SsoRegistration> {
-        match SsoRegistration::from_cache().await {
+        match SsoRegistration::from_cache(sso_region).await {
             Some(reg) => {
                 if reg.is_expired() {
                     info!("SSO registration is expired. Registering new client.");
@@ -36,8 +36,8 @@ impl SsoRegistration {
         }
     }
 
-    async fn from_cache() -> Option<SsoRegistration> {
-        get_cached_sso_registration().await
+    async fn from_cache(sso_region: &str) -> Option<SsoRegistration> {
+        get_cached_sso_registration(sso_region).await
     }
 
     pub fn is_expired(&self) -> bool {
@@ -112,7 +112,7 @@ impl SsoRegistration {
             clientId: client_id,
             expiresAt: datetime.to_rfc3339(),
         };
-        cache_sso_registration(&res).await?;
+        cache_sso_registration(sso_region, &res).await?;
         Ok(res)
     }
 }

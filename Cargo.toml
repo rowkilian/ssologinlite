@@ -13,6 +13,12 @@ tokio = { version = "1", features = ["full"] }
 aws-sdk-sts = "1.39.0"
 aws-sdk-sso = "1.39.0"
 aws-sdk-ssooidc = "1.39.0"
+# Pinned exactly (=) to the same SDK generation as the crates above: the AWS SDK
+# raised its MSRV to 1.78 on the 2024-08-28 release, and this crate targets
+# rust-version 1.77.2. A caret range would let `cargo update` drift past that.
+aws-sdk-ecr = "=1.39.0"
+aws-sdk-codeartifact = "=1.39.0"
+aws-sdk-redshift = "=1.39.0"
 aws-types = "1.3.3"
 aws-smithy-types = "1.2.2"
 aws-config = "1.5.5"
@@ -43,6 +49,9 @@ base64 = "0.22.1"
 ratatui = "0.29"
 crossterm = "0.28"
 toml = "0.8"
+# Advisory file locking to serialize concurrent credential_process invocations
+# against the shared credential cache. MSRV well under 1.77.2.
+fs2 = "0.4"
 
 [dev-dependencies]
 proptest = "1.4"
@@ -56,6 +65,5 @@ codegen-units = 1
 panic = 'abort'
 opt-level = 'z'
 
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-ar = "x86_64-w64-mingw32-gcc-ar"
+# Windows cross-compilation toolchain lives in .cargo/config.toml — cargo ignores
+# [target.*] linker/ar keys when they are placed in Cargo.toml.

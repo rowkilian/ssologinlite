@@ -4,13 +4,16 @@ use crate::cache::{cache_sso_credentials, get_cached_sso_credentials};
 use crate::config::ProgramConfig;
 use crate::mywebbrowser::open_url;
 use anyhow::{anyhow, Result};
-use aws_config::sso::credentials::Builder;
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
-use chrono::{Duration, Local, NaiveDateTime};
+use chrono::{Duration, NaiveDateTime, Utc};
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration as StdDuration, Instant};
+
+// Refresh this many seconds before the real expiry so a token with only moments
+// left isn't returned and then rejected by AWS mid-call.
+const EXPIRY_SKEW_SECS: i64 = 60;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[allow(non_snake_case)]
@@ -142,16 +145,13 @@ impl SsoCredentials {
     pub async fn login_url_from_aws(profile: SsoProfile) -> Result<UrlCode> {
         info!("getting login url from AWS");
         let sdkregion = sdkRegion::new(profile.sso_region.clone());
-        let provider = Builder::new()
-            .region(sdkregion.clone())
-            .role_name(&profile.sso_role_name)
-            .account_id(&profile.sso_account_id)
-            .start_url(profile.sso_start_url.clone())
-            .build();
+        // No credentials_provider: start_device_authorization authenticates with
+        // the registered client_id/client_secret, not SSO credentials. Attaching
+        // an SSO provider here would be circular (it resolves the very token this
+        // flow exists to obtain).
         let config = aws_sdk_ssooidc::Config::builder()
             .region(sdkregion)
             .behavior_version(aws_sdk_ssooidc::config::BehaviorVersion::latest())
-            .credentials_provider(provider)
             .build();
 
         let client = aws_sdk_ssooidc::Client::from_conf(config);
@@ -202,16 +202,11 @@ impl SsoCredentials {
         info!("getting token from AWS");
         let registration = SsoRegistration::get(&profile.sso_region).await?;
         let sdkregion = sdkRegion::new(profile.sso_region.clone());
-        let provider = Builder::new()
-            .region(sdkregion.clone())
-            .role_name(&profile.sso_role_name)
-            .account_id(&profile.sso_account_id)
-            .start_url(&profile.sso_start_url)
-            .build();
+        // No credentials_provider: create_token authenticates with the client
+        // secret + device_code, not SSO credentials (see login_url_from_aws).
         let config = aws_sdk_ssooidc::Config::builder()
             .region(sdkregion)
             .behavior_version(aws_sdk_ssooidc::config::BehaviorVersion::latest())
-            .credentials_provider(provider)
             .build();
 
         let client = aws_sdk_ssooidc::Client::from_conf(config);
@@ -259,7 +254,10 @@ impl SsoCredentials {
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
             }
         };
-        let expiration = Local::now().naive_local() + Duration::seconds(output.expires_in.into());
+        // Store the expiry as a real UTC instant. The `Z`-suffixed format below
+        // labels the value as UTC, so it must be built from UTC — using local
+        // time here would mislabel a local wall-clock time as UTC.
+        let expiration = Utc::now().naive_utc() + Duration::seconds(output.expires_in.into());
         let url = profile.sso_start_url.clone();
         let mut hash_url = sha1_smol::Sha1::new();
         hash_url.update(url.as_bytes());
@@ -277,7 +275,7 @@ impl SsoCredentials {
 
     pub fn expires(&self) -> Result<(chrono::Duration, bool)> {
         info!("checking token expiration");
-        let now = Local::now().naive_local();
+        let now = Utc::now().naive_utc();
         let pre_exp = &self.expiresAt;
         let exp_dt = match NaiveDateTime::parse_from_str(&pre_exp[..], "%Y-%m-%dT%H:%M:%SZ") {
             Ok(expiration) => expiration,
@@ -287,7 +285,10 @@ impl SsoCredentials {
             }
         };
         let expires_in = exp_dt - now;
-        Ok((expires_in, now > exp_dt))
+        // expires_in stays the true remaining time, but the "expired" flag trips
+        // EXPIRY_SKEW_SECS early so we refresh before a token can lapse mid-use.
+        let expired = now + Duration::seconds(EXPIRY_SKEW_SECS) > exp_dt;
+        Ok((expires_in, expired))
     }
 
     pub fn is_expired(&self) -> bool {
@@ -295,10 +296,6 @@ impl SsoCredentials {
             Ok((_, expired)) => expired,
             Err(_) => true,
         }
-    }
-
-    pub fn get_access_token(&self) -> String {
-        self.accessToken.clone()
     }
 }
 
@@ -346,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_expires_future_date() {
-        let future = (Local::now().naive_local() + Duration::hours(2))
+        let future = (Utc::now().naive_utc() + Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&future);
@@ -357,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_expires_past_date() {
-        let past = (Local::now().naive_local() - Duration::hours(2))
+        let past = (Utc::now().naive_utc() - Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&past);
@@ -382,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_is_expired_future() {
-        let future = (Local::now().naive_local() + Duration::hours(2))
+        let future = (Utc::now().naive_utc() + Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&future);
@@ -391,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_is_expired_past() {
-        let past = (Local::now().naive_local() - Duration::hours(2))
+        let past = (Utc::now().naive_utc() - Duration::hours(2))
             .format("%Y-%m-%dT%H:%M:%SZ")
             .to_string();
         let creds = make_creds(&past);
@@ -402,14 +399,6 @@ mod tests {
     fn test_is_expired_invalid_returns_true() {
         let creds = make_creds("garbage");
         assert!(creds.is_expired());
-    }
-
-    // --- get_access_token() ---
-
-    #[test]
-    fn test_get_access_token() {
-        let creds = make_creds("2099-01-01T00:00:00Z");
-        assert_eq!(creds.get_access_token(), "test-access-token-123");
     }
 
     // --- Serde ---
@@ -496,17 +485,17 @@ mod tests {
 
     proptest! {
         #[test]
-        fn test_expires_sign_matches_bool(offset in -168i64..168i64) {
-            let dt = Local::now().naive_local() + Duration::hours(offset);
+        fn test_expires_sign_matches_bool(offset_secs in -604800i64..604800i64) {
+            let dt = Utc::now().naive_utc() + Duration::seconds(offset_secs);
             let formatted = dt.format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let creds = make_creds(&formatted);
             if let Ok((dur, expired)) = creds.expires() {
-                // If expired is true, duration should be negative (or close to 0)
-                // If expired is false, duration should be positive (or close to 0)
+                // The "expired" flag trips EXPIRY_SKEW_SECS before real expiry.
+                // (±1s slack absorbs the clock ticks between building dt and now.)
                 if expired {
-                    prop_assert!(dur.num_seconds() <= 1);
+                    prop_assert!(dur.num_seconds() <= EXPIRY_SKEW_SECS + 1);
                 } else {
-                    prop_assert!(dur.num_seconds() >= -1);
+                    prop_assert!(dur.num_seconds() >= EXPIRY_SKEW_SECS - 1);
                 }
             }
         }

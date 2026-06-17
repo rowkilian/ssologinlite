@@ -3,9 +3,11 @@ use anyhow::{anyhow, Result};
 use chrono::Local;
 use home::home_dir;
 use log::{debug, error};
-use std::ffi::OsString;
-use std::fs::{copy, metadata, set_permissions, Permissions};
-use std::os::unix::fs::PermissionsExt;
+use std::ffi::{OsStr, OsString};
+use std::fs::{copy, metadata, set_permissions, OpenOptions, Permissions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 
 pub fn backup_config() -> Result<()> {
     let aws_config = get_aws_config()?;
@@ -26,24 +28,6 @@ pub fn backup_config() -> Result<()> {
     Ok(())
 }
 
-pub fn get_relative_os_string(input: &str) -> Result<OsString> {
-    match std::env::current_exe() {
-        Ok(current_exe) => match current_exe.parent() {
-            Some(current_fold) => {
-                let mut res = current_fold.to_path_buf();
-                for part in input.split('/') {
-                    res.push(part);
-                }
-                Ok(res.into_os_string())
-            }
-            None => Err(anyhow!(MyErrors::Path)),
-        },
-        Err(e) => {
-            error!("{}", e);
-            Err(anyhow!(MyErrors::CurrentExe))
-        }
-    }
-}
 pub fn get_home_os_string(input: &str) -> Result<OsString> {
     match home_dir() {
         Some(home) => {
@@ -77,6 +61,42 @@ pub fn restrict_file_permissions(file: &OsString) -> Result<()> {
     let mut permissions = metadata(file)?.permissions();
     permissions.set_mode(perm);
     set_permissions(file, Permissions::from_mode(perm))?;
+    Ok(())
+}
+
+/// Write `bytes` to `path` atomically and with 0o600 permissions: write to a
+/// temp file in the same directory (so the final rename stays on one
+/// filesystem), fsync it, then rename over the destination. A crash or full
+/// disk leaves either the previous file or the complete new one — never a
+/// truncated mix. Used for the credential/profile/config files that a partial
+/// write would corrupt.
+pub fn write_atomic(path: &OsStr, bytes: &[u8]) -> Result<()> {
+    let dest = Path::new(path);
+    let parent = match dest.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+    std::fs::create_dir_all(&parent)?;
+    let file_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ssologinlite");
+    let tmp = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    // Clean up the temp file if the rename fails so we don't leak it.
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -179,21 +199,6 @@ mod tests {
     fn test_get_exe_path_non_empty() {
         let result = get_exe_path().unwrap();
         assert!(!result.is_empty());
-    }
-
-    // --- get_relative_os_string() ---
-
-    #[test]
-    fn test_get_relative_os_string_returns_ok() {
-        let result = get_relative_os_string("some/path");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_relative_os_string_ends_with_input() {
-        let result = get_relative_os_string("some/path").unwrap();
-        let path = Path::new(&result);
-        assert!(path.ends_with("some/path"));
     }
 
     // --- restrict_file_permissions() ---

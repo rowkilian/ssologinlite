@@ -3,13 +3,14 @@ use anyhow::{anyhow, Result};
 // use aws_config::imds::credentials;
 use clap::Parser;
 use log::{debug, error};
+use ssologinlite::aws_credentials::AWScredentials;
 use ssologinlite::aws_profile::{Profile::AssumeSsoProfile, Profile::SsoProfile, Profiles};
 use ssologinlite::aws_sso_credentials::SsoCredentials;
 use ssologinlite::config::ProgramConfig;
 use ssologinlite::eks::EksToken;
 use ssologinlite::logger::logger;
 use ssologinlite::parser::{Cli, Commands};
-use ssologinlite::tui;
+use ssologinlite::{codeartifact, ecr, rds, redshift, tui};
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -52,31 +53,8 @@ async fn main() -> Result<ExitCode> {
             }
         }
         Commands::Eks(args) => {
-            debug!("Getting creds for {:?}", args.profile);
-            let profile = Profiles::get_profile(args.profile.clone())?;
-            debug!("Profile {:?}", profile);
-
-            // Match on the profile type and get the token
-            let (credentials, profile_region) = match profile {
-                SsoProfile(profile) => (profile.get_credentials().await?, profile.region),
-                AssumeSsoProfile(profile) => {
-                    (profile.get_credentials().await?, Some(profile.region))
-                }
-                _ => {
-                    error!("Profile not found");
-                    return Err(anyhow!(MyErrors::ProfileNotFoundError));
-                }
-            };
-            let region = match args.region.clone() {
-                Some(region) => region,
-                None => match profile_region {
-                    Some(region) => region,
-                    None => {
-                        error!("Region not found");
-                        return Err(anyhow!(MyErrors::RegionNotFoundError));
-                    }
-                },
-            };
+            let (credentials, profile_region) = creds_and_region(args.profile.clone()).await?;
+            let region = resolve_region(args.region.clone(), profile_region)?;
             let cluster = match args.cluster.clone() {
                 Some(cluster) => cluster,
                 None => {
@@ -86,6 +64,51 @@ async fn main() -> Result<ExitCode> {
             };
             let eks_token = EksToken::from_credentials(credentials, region, &cluster)?;
             println!("{}", eks_token);
+        }
+        Commands::Ecr(args) => {
+            let (credentials, profile_region) = creds_and_region(args.profile.clone()).await?;
+            let region = resolve_region(args.region.clone(), profile_region)?;
+            let password = ecr::get_login_password(credentials, region).await?;
+            println!("{}", password);
+        }
+        Commands::Rds(args) => {
+            let (credentials, profile_region) = creds_and_region(args.profile.clone()).await?;
+            let region = resolve_region(args.region.clone(), profile_region)?;
+            let token = rds::generate_db_auth_token(
+                credentials,
+                region,
+                &args.host,
+                args.port,
+                &args.db_user,
+            );
+            println!("{}", token);
+        }
+        Commands::CodeArtifact(args) => {
+            let (credentials, profile_region) = creds_and_region(args.profile.clone()).await?;
+            let region = resolve_region(args.region.clone(), profile_region)?;
+            let token = codeartifact::get_authorization_token(
+                credentials,
+                region,
+                &args.domain,
+                &args.domain_owner,
+                args.duration_seconds,
+            )
+            .await?;
+            println!("{}", token);
+        }
+        Commands::Redshift(args) => {
+            let (credentials, profile_region) = creds_and_region(args.profile.clone()).await?;
+            let region = resolve_region(args.region.clone(), profile_region)?;
+            let creds_json = redshift::get_cluster_credentials(
+                credentials,
+                region,
+                &args.cluster_id,
+                &args.db_user,
+                args.db_name.clone(),
+                args.auto_create,
+            )
+            .await?;
+            println!("{}", creds_json);
         }
         Commands::SSOExpiration => {
             let conf = ProgramConfig::new()?;
@@ -132,6 +155,37 @@ async fn main() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::from(0))
+}
+
+// Resolve a profile name to its credentials and (optional) configured region.
+// Shared by every credential-emitting subcommand.
+async fn creds_and_region(profile_name: String) -> Result<(AWScredentials, Option<String>)> {
+    debug!("Getting creds for {:?}", profile_name);
+    let profile = Profiles::get_profile(profile_name)?;
+    debug!("Profile {:?}", profile);
+    match profile {
+        SsoProfile(p) => {
+            let region = p.region.clone();
+            Ok((p.get_credentials().await?, region))
+        }
+        AssumeSsoProfile(p) => {
+            let region = Some(p.region.clone());
+            Ok((p.get_credentials().await?, region))
+        }
+        _ => {
+            error!("Profile not found");
+            Err(anyhow!(MyErrors::ProfileNotFoundError))
+        }
+    }
+}
+
+// A region from the CLI argument wins; otherwise fall back to the profile's
+// configured region; otherwise it's an error.
+fn resolve_region(arg_region: Option<String>, profile_region: Option<String>) -> Result<String> {
+    arg_region.or(profile_region).ok_or_else(|| {
+        error!("Region not found");
+        anyhow!(MyErrors::RegionNotFoundError)
+    })
 }
 
 // Custom error enum. The shared "Error" suffix is intentional and matches
