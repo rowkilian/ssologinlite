@@ -232,12 +232,19 @@ where
     };
     info!("opening cache file {} for writing.", cache_str);
     // Serialize the whole load-modify-dump against concurrent writers/readers.
-    // Held until function return.
+    // Best-effort: locking is a concurrency optimization, not a correctness
+    // requirement for a single invocation. If the lock can't be taken (e.g. a
+    // filesystem without flock support), log and proceed unlocked rather than
+    // failing — failing here would discard credentials we already fetched from
+    // AWS. Held until function return.
     let _lock = match acquire_cache_lock(true) {
-        Ok(l) => l,
+        Ok(l) => Some(l),
         Err(e) => {
-            error!("cache.store_cache: could not acquire lock: {}", e);
-            return Err(anyhow!(MyErrors::Cache));
+            error!(
+                "cache.store_cache: could not acquire lock, proceeding unlocked: {}",
+                e
+            );
+            None
         }
     };
     let mut db = open_or_recover_db(str_cache_file.as_os_str())?;
