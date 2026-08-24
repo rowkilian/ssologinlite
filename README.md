@@ -28,7 +28,7 @@ default_sso_url = "https://myawsorg.awsapps.com/start/"
 - **AWS SSO Profile Management**: Automatically configure and manage SSO profiles
 - **Assume Role Support**: Seamlessly handle role assumption across accounts
 - **EKS Authentication**: Generate kubectl-compatible authentication tokens
-- **Credential Caching**: Reduce authentication overhead with intelligent caching
+- **Credential Caching**: Reduce authentication overhead with intelligent caching, cleared on demand with `logout`
 - **Shell Integration**: Starship prompt integration for credential expiration warnings
 
 ## Installation
@@ -115,6 +115,19 @@ users:
         - --region
         - us-west-2
 ```
+
+### Logout
+
+Remove every locally cached credential — the SSO access token, all per-profile role
+credentials, and the OIDC client registration all live in a single cache file, so this
+logs you out of everything at once:
+
+```bash
+ssologinlite logout
+```
+
+The next command triggers a fresh browser SSO login. This is safe to run when nothing
+is cached, and it leaves `profiles.json` and the log files alone.
 
 ### Debug Mode
 

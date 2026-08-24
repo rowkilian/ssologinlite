@@ -11,7 +11,7 @@ use aws_smithy_types_convert::date_time::DateTimeExt;
 use aws_types::region::Region as sdkRegion;
 use aws_types::sdk_config::SharedCredentialsProvider;
 use chrono::{DateTime as CDateTime, Local};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use whoami;
 
@@ -69,7 +69,19 @@ impl AWScredentials {
                     error!("aws_credentials.AWScredentials.get_or_refresh {}", e);
                     e
                 })?;
-                store_cached_credentials(cache_key, &creds).await?;
+                // A cache-write failure must not discard credentials we just
+                // fetched successfully — they are valid and usable right now, and
+                // the only cost of not persisting them is a re-fetch next time.
+                // Propagating the error here would emit nothing at all, breaking
+                // callers like kubectl's exec credential plugin, and only ever on
+                // the uncached path (this is the sole caller of store_cache for
+                // role credentials).
+                if let Err(e) = store_cached_credentials(cache_key, &creds).await {
+                    warn!(
+                        "aws_credentials.AWScredentials.get_or_refresh: could not cache credentials for {}, continuing with the live credentials: {}",
+                        cache_key, e
+                    );
+                }
                 Ok(creds)
             }
         }

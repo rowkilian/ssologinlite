@@ -7,13 +7,27 @@ use anyhow::{anyhow, Result};
 use aws_sdk_ssooidc;
 use aws_types::region::Region as sdkRegion;
 use chrono::{Duration, NaiveDateTime, Utc};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration as StdDuration, Instant};
 
 // Refresh this many seconds before the real expiry so a token with only moments
 // left isn't returned and then rejected by AWS mid-call.
 const EXPIRY_SKEW_SECS: i64 = 60;
+
+// Consecutive unclassified create_token failures tolerated while polling before
+// the device-code login is abandoned.
+const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+
+// Added to the poll interval each time AWS answers SlowDownException.
+const SLOW_DOWN_BACKOFF_SECS: u64 = 5;
+
+// True when `e` is the given MyErrors variant. create_token tags its expected
+// polling responses this way so refresh() can tell them apart from real errors.
+fn is_error(e: &anyhow::Error, want: MyErrors) -> bool {
+    e.downcast_ref::<MyErrors>()
+        .is_some_and(|got| std::mem::discriminant(got) == std::mem::discriminant(&want))
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[allow(non_snake_case)]
@@ -105,36 +119,64 @@ impl SsoCredentials {
         })?;
 
         let deadline = Instant::now() + StdDuration::from_secs(expires_in_secs);
+        let mut poll_interval = StdDuration::from_secs(interval_secs);
+        let mut consecutive_errors: u32 = 0;
         while Instant::now() < deadline {
-            tokio::time::sleep(StdDuration::from_secs(interval_secs)).await;
+            tokio::time::sleep(poll_interval).await;
             match SsoCredentials::create_token(profile.clone(), device_code.clone()).await {
                 Ok(creds) => {
                     debug!("device-code authorization completed");
                     return Ok(creds);
                 }
-                Err(e) => {
-                    // create_token uses MyErrors::AuthorizationPending for the
-                    // expected "not-yet-authorized" / "slow down" responses;
-                    // anything else (invalid client/grant, expired device code,
-                    // access denied, network error) is fatal and we surface it
-                    // immediately rather than burning the rest of the deadline
-                    // on a permanent failure.
-                    let pending = e
-                        .downcast_ref::<MyErrors>()
-                        .map(|me| matches!(me, MyErrors::AuthorizationPending))
-                        .unwrap_or(false);
-                    if pending {
-                        debug!("device-code not yet authorized; continuing to poll");
-                        continue;
-                    }
-                    error!(
-                        "aws_sso_credentials.SsoCredentials.refresh: fatal error during polling: {}",
-                        e
+                // AuthorizationPending is the normal "user hasn't clicked through
+                // yet" response — keep polling at the same rate.
+                Err(e) if is_error(&e, MyErrors::AuthorizationPending) => {
+                    consecutive_errors = 0;
+                    debug!("device-code not yet authorized; continuing to poll");
+                }
+                // SlowDown means AWS is rejecting our poll rate. Continuing to
+                // poll at the rejected interval just keeps getting refused, so
+                // actually back off.
+                Err(e) if is_error(&e, MyErrors::SlowDown) => {
+                    consecutive_errors = 0;
+                    poll_interval += StdDuration::from_secs(SLOW_DOWN_BACKOFF_SECS);
+                    debug!(
+                        "AWS asked us to slow down; polling every {}s from now on",
+                        poll_interval.as_secs()
                     );
-                    return Err(e);
+                }
+                // Anything else (network blip, transient 5xx, an SDK error we
+                // don't classify) gets a bounded number of retries. Aborting the
+                // whole login on the first one lets a single hiccup kill a
+                // browser flow the user has already started — the original
+                // implementation retried every error until the device code
+                // expired, which was too permissive in the other direction.
+                Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!(
+                            "aws_sso_credentials.SsoCredentials.refresh: giving up after \
+                             {} consecutive errors while polling for the device code: {}",
+                            consecutive_errors, e
+                        );
+                        return Err(e);
+                    }
+                    warn!(
+                        "aws_sso_credentials.SsoCredentials.refresh: error while polling \
+                         ({}/{}), retrying: {}",
+                        consecutive_errors, MAX_CONSECUTIVE_ERRORS, e
+                    );
                 }
             }
         }
+        // Logged, not just returned: this is the cold path's most likely dead end
+        // and the polling detail above is debug-only, so at the default INFO level
+        // this line is the only record of why the login produced nothing.
+        error!(
+            "aws_sso_credentials.SsoCredentials.refresh: device-code authorization \
+             timed out after {} seconds",
+            expires_in_secs
+        );
         Err(anyhow!(
             "SSO device-code authorization timed out after {} seconds; \
              the browser flow was not completed in time",
@@ -224,25 +266,29 @@ impl SsoCredentials {
         {
             Ok(output) => output,
             Err(e) => {
-                // The polling loop in refresh() distinguishes "not yet
-                // authorized" / "slow down" from fatal errors; tag the
-                // expected polling responses with AuthorizationPending so
-                // the caller can keep waiting, and fail fast on everything
-                // else (invalid client/grant, expired device code, access
-                // denied, network errors).
+                // Tag the two expected polling responses with their own
+                // variants so refresh() can tell "keep waiting" from "keep
+                // waiting, but slower". Everything else (invalid client/grant,
+                // expired device code, access denied, network errors) collapses
+                // to GetRoleCredentialError, which refresh() retries a bounded
+                // number of times before giving up.
                 use aws_sdk_ssooidc::operation::create_token::CreateTokenError;
-                if matches!(
-                    e.as_service_error(),
-                    Some(
-                        CreateTokenError::AuthorizationPendingException(_)
-                            | CreateTokenError::SlowDownException(_)
-                    )
-                ) {
-                    debug!(
-                        "aws_sso_credentials.SsoCredentials.create_token (pending): {}",
-                        e
-                    );
-                    return Err(anyhow!(MyErrors::AuthorizationPending));
+                match e.as_service_error() {
+                    Some(CreateTokenError::AuthorizationPendingException(_)) => {
+                        debug!(
+                            "aws_sso_credentials.SsoCredentials.create_token (pending): {}",
+                            e
+                        );
+                        return Err(anyhow!(MyErrors::AuthorizationPending));
+                    }
+                    Some(CreateTokenError::SlowDownException(_)) => {
+                        debug!(
+                            "aws_sso_credentials.SsoCredentials.create_token (slow down): {}",
+                            e
+                        );
+                        return Err(anyhow!(MyErrors::SlowDown));
+                    }
+                    _ => {}
                 }
                 error!("aws_sso_credentials.SsoCredentials.create_token {}", e);
                 return Err(anyhow!(MyErrors::GetRoleCredentialError));
@@ -306,10 +352,11 @@ enum MyErrors {
     GetRoleCredentialError,
     GetUrlError,
     CredentialsFromURLError,
-    // Tags create_token's expected polling responses (AuthorizationPending /
-    // SlowDown) so the refresh() loop can distinguish "keep waiting" from
-    // a fatal SDK error and fail fast on the latter.
+    // Tags create_token's expected polling responses so the refresh() loop can
+    // distinguish "keep waiting" (AuthorizationPending), "keep waiting, but
+    // slower" (SlowDown), and a real error that only gets a bounded retry.
     AuthorizationPending,
+    SlowDown,
 }
 
 impl std::fmt::Display for MyErrors {
@@ -322,6 +369,7 @@ impl std::fmt::Display for MyErrors {
             Self::AuthorizationPending => {
                 write!(f, "device-code authorization is still pending")
             }
+            Self::SlowDown => write!(f, "AWS asked us to slow down polling"),
         }
     }
 }

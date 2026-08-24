@@ -12,7 +12,8 @@ use serde_json;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration as StdDuration, Instant};
 
 // Get cache
 pub async fn get_cached_credentials(profile: &str) -> Option<AWScredentials> {
@@ -129,6 +130,15 @@ fn cache_lock_path() -> Result<std::ffi::OsString> {
     get_home_os_string(format!("{}/{}.lock", PROGRAM_FOLDER, CREDS_CACHE).as_str())
 }
 
+// Longest we wait for the cache lock before giving up. flock has no writer
+// preference on macOS, so a steady stream of short-lived readers — the
+// `ssoexpiration` statusline poller runs every few seconds — can stall or
+// starve a *blocking* exclusive request indefinitely. Both call sites already
+// degrade gracefully when the lock can't be taken, so a bounded wait is
+// strictly better than hanging a credential_process invocation.
+const LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(5);
+const LOCK_RETRY_INTERVAL: StdDuration = StdDuration::from_millis(50);
+
 // Acquire an advisory (flock) lock on the sidecar lock file: exclusive for
 // writers, shared for readers. The returned File releases the lock on Drop —
 // including on process exit/panic, which matters for short-lived
@@ -143,15 +153,35 @@ fn acquire_cache_lock(exclusive: bool) -> Result<File> {
         .truncate(false)
         .mode(0o600)
         .open(Path::new(&lock_path))?;
-    // Fully-qualified so this always resolves to fs2's trait method. Rust 1.89
-    // added inherent File::lock_exclusive/lock_shared, which would otherwise win
-    // method resolution and break the 1.77.2 MSRV.
-    if exclusive {
-        fs2::FileExt::lock_exclusive(&f)?;
-    } else {
-        fs2::FileExt::lock_shared(&f)?;
+
+    let deadline = Instant::now() + LOCK_TIMEOUT;
+    loop {
+        // Fully-qualified so this always resolves to fs2's trait method. Rust
+        // 1.89 added inherent File::try_lock_exclusive/try_lock_shared, which
+        // would otherwise win method resolution and break the 1.77.2 MSRV.
+        let attempt = if exclusive {
+            fs2::FileExt::try_lock_exclusive(&f)
+        } else {
+            fs2::FileExt::try_lock_shared(&f)
+        };
+        match attempt {
+            Ok(()) => return Ok(f),
+            Err(e) => {
+                // Only contention is worth retrying; anything else (no flock
+                // support on the filesystem, bad descriptor) will never succeed.
+                if e.raw_os_error() != fs2::lock_contended_error().raw_os_error() {
+                    return Err(e.into());
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "timed out after {:?} waiting for the cache lock",
+                        LOCK_TIMEOUT
+                    ));
+                }
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+        }
     }
-    Ok(f)
 }
 
 // Open the cache DB for writing, recovering from an unreadable file without
@@ -265,6 +295,75 @@ where
     }
 }
 
+// Remove the credential cache and any quarantined copies of it from `dir`,
+// returning the paths that were removed.
+//
+// The `.lock` sidecar is deliberately left in place: it holds no credentials,
+// and unlinking it while another process has it open would silently break
+// mutual exclusion — that process keeps its flock on the now-detached inode
+// while a newcomer creates a fresh file and locks that instead.
+//
+// The `.corrupt.<timestamp>` quarantine files written by open_or_recover_db
+// *are* removed: they are verbatim copies of a cache that held credentials.
+fn remove_cache_files(dir: &Path, cache_name: &str) -> Result<Vec<PathBuf>> {
+    let quarantine_prefix = format!("{}.corrupt.", cache_name);
+    let mut removed: Vec<PathBuf> = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Never logged in on this machine — nothing to remove is a successful
+        // logout, not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name == cache_name || file_name.starts_with(&quarantine_prefix) {
+            let path = entry.path();
+            std::fs::remove_file(&path)?;
+            removed.push(path);
+        }
+    }
+    // read_dir order is filesystem-defined; sort so output is stable.
+    removed.sort();
+    Ok(removed)
+}
+
+// Delete every locally cached credential. The SSO access token, the per-profile
+// role credentials and the OIDC client registration all live in the one
+// PickleDb file, so removing it logs the user out of everything at once and the
+// next command falls back to a fresh browser SSO login.
+pub async fn clear_cache() -> Result<Vec<PathBuf>> {
+    let cache_file = get_home_os_string(format!("{}/{}", PROGRAM_FOLDER, CREDS_CACHE).as_str())?;
+    let dir = match Path::new(&cache_file).parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => return Err(anyhow!(MyErrors::Cache)),
+    };
+
+    // Take the writer lock so the file can't be unlinked out from under a
+    // concurrent store_cache mid-dump. Best-effort for the same reason as
+    // store_cache: failing to lock is not a reason to refuse to log out.
+    let _lock = match acquire_cache_lock(true) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            error!(
+                "cache.clear_cache: could not acquire lock, proceeding unlocked: {}",
+                e
+            );
+            None
+        }
+    };
+
+    let removed = remove_cache_files(&dir, CREDS_CACHE)?;
+    for path in &removed {
+        info!("removed cached credentials file {}", path.display());
+    }
+    Ok(removed)
+}
+
 // Error definitions
 #[derive(Debug)]
 enum MyErrors {
@@ -276,5 +375,98 @@ impl std::fmt::Display for MyErrors {
         match self {
             Self::Cache => write!(f, "Problem caching data!"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const CACHE: &str = ".ssologinlite_cache";
+
+    fn touch(dir: &Path, name: &str) {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn test_remove_cache_files_removes_cache_and_quarantines() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        touch(dir, CACHE);
+        touch(dir, ".ssologinlite_cache.corrupt.20260823T120000");
+        touch(dir, ".ssologinlite_cache.corrupt.20260824T130000");
+
+        let removed = remove_cache_files(dir, CACHE).unwrap();
+
+        assert_eq!(
+            names(&removed),
+            vec![
+                ".ssologinlite_cache",
+                ".ssologinlite_cache.corrupt.20260823T120000",
+                ".ssologinlite_cache.corrupt.20260824T130000",
+            ]
+        );
+        assert!(!dir.join(CACHE).exists());
+    }
+
+    #[test]
+    fn test_remove_cache_files_keeps_lock_and_unrelated_files() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        touch(dir, CACHE);
+        // The lock sidecar holds no credentials, and unlinking it would break
+        // mutual exclusion for a process that already has it open.
+        touch(dir, ".ssologinlite_cache.lock");
+        touch(dir, "profiles.json");
+        touch(dir, "config.exported.20260528T152832");
+
+        let removed = remove_cache_files(dir, CACHE).unwrap();
+
+        assert_eq!(names(&removed), vec![".ssologinlite_cache"]);
+        assert!(dir.join(".ssologinlite_cache.lock").exists());
+        assert!(dir.join("profiles.json").exists());
+        assert!(dir.join("config.exported.20260528T152832").exists());
+    }
+
+    #[test]
+    fn test_remove_cache_files_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        touch(dir, CACHE);
+
+        assert_eq!(remove_cache_files(dir, CACHE).unwrap().len(), 1);
+        // Logging out twice is not an error.
+        assert!(remove_cache_files(dir, CACHE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_cache_files_missing_dir_is_not_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("never-logged-in");
+        assert!(remove_cache_files(&missing, CACHE).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_cache_files_ignores_directories_named_like_the_cache() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        // A directory would make remove_file fail; make sure a name that only
+        // *starts* with the cache name but isn't a quarantine file is skipped.
+        fs::create_dir(dir.join(".ssologinlite_cache_backups")).unwrap();
+        touch(dir, CACHE);
+
+        let removed = remove_cache_files(dir, CACHE).unwrap();
+
+        assert_eq!(names(&removed), vec![".ssologinlite_cache"]);
+        assert!(dir.join(".ssologinlite_cache_backups").is_dir());
     }
 }
