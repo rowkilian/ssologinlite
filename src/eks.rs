@@ -387,6 +387,30 @@ mod tests {
         assert!(url2.contains("eu-west-1"));
     }
 
+    // Golden test: with every input pinned (including the date), the signed URL
+    // is fully deterministic, so this asserts the exact bytes rather than a few
+    // `contains` probes. The rest of the tests in this module can't tell a
+    // signature change from a no-op refactor; this one can. If it fails, the
+    // wire format of the EKS token changed — which is only ever correct if AWS
+    // changed theirs.
+    #[test]
+    fn test_signed_url_is_byte_exact_for_pinned_inputs() {
+        use chrono::TimeZone;
+        let options = GetSignedUrlOptions {
+            region: "eu-west-1".to_string(),
+            access_key_id: "ASIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYzEXAMPLEKEY".to_string(),
+            security_token: "SESSIONTOKEN123".to_string(),
+            date: Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap(),
+            ..GetSignedUrlOptions::default()
+        };
+        let url = get_signed_url(&options, "core-dev");
+        assert_eq!(
+            url,
+            "https://sts.eu-west-1.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ASIAIOSFODNN7EXAMPLE%2F20260823%2Feu-west-1%2Fsts%2Faws4_request&X-Amz-Date=20260823T120000Z&X-Amz-Expires=60&X-Amz-Security-Token=SESSIONTOKEN123&X-Amz-SignedHeaders=host%3Bx-k8s-aws-id&X-Amz-Signature=df1f4066beda628d1ce7a9013f52428d486b8b93d10dd78e56cd4c1af2f90296"
+        );
+    }
+
     #[test]
     fn test_token_round_trip_decodes_to_signed_url() {
         // Status::from_credentials produces a token of the form

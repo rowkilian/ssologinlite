@@ -10,7 +10,7 @@ use ssologinlite::config::ProgramConfig;
 use ssologinlite::eks::EksToken;
 use ssologinlite::logger::logger;
 use ssologinlite::parser::{Cli, Commands};
-use ssologinlite::{codeartifact, ecr, rds, redshift, tui};
+use ssologinlite::{cache, codeartifact, ecr, rds, redshift, tui};
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -109,6 +109,16 @@ async fn main() -> Result<ExitCode> {
             )
             .await?;
             println!("{}", creds_json);
+        }
+        Commands::Logout => {
+            let removed = cache::clear_cache().await?;
+            if removed.is_empty() {
+                println!("No cached credentials to remove.");
+            } else {
+                for path in removed {
+                    println!("Removed {}", path.display());
+                }
+            }
         }
         Commands::SSOExpiration => {
             let conf = ProgramConfig::new()?;

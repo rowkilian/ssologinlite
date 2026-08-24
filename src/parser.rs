@@ -31,6 +31,10 @@ pub enum Commands {
     CodeArtifact(CodeArtifactArgs),
     /// Get temporary Redshift cluster credentials (JSON).
     Redshift(RedshiftArgs),
+    /// Remove every locally cached credential (SSO access token, role
+    /// credentials, OIDC client registration). The next command starts a
+    /// fresh browser SSO login.
+    Logout,
     /// Time left before the next sso login.
     SSOExpiration,
     /// Exit code 0 if sso login is required.
@@ -347,6 +351,20 @@ mod tests {
     fn test_eks_missing_profile() {
         let result = Cli::try_parse_from(["ssologinlite", "eks"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_logout_subcommand() {
+        let cli = Cli::try_parse_from(["ssologinlite", "logout"]).unwrap();
+        assert!(matches!(cli.command, Commands::Logout));
+    }
+
+    #[test]
+    fn test_logout_takes_no_arguments() {
+        // Logout is deliberately all-or-nothing: the SSO token, every profile's
+        // role credentials and the client registration share one cache file, so
+        // there is no per-profile logout to offer.
+        assert!(Cli::try_parse_from(["ssologinlite", "logout", "--profile", "prod"]).is_err());
     }
 
     #[test]
