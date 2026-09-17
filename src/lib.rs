@@ -9,6 +9,7 @@ pub mod constants;
 pub mod ecr;
 pub mod eks;
 pub mod file_helper;
+pub mod imds_credentials;
 pub mod logger;
 pub mod mywebbrowser;
 pub mod parser;

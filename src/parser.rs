@@ -35,6 +35,9 @@ pub enum Commands {
     /// credentials, OIDC client registration). The next command starts a
     /// fresh browser SSO login.
     Logout,
+    /// Get EC2 instance-role credentials via IMDSv2 (JSON), for use as a
+    /// credential_process on a host with an attached IAM role and no SSO.
+    Imds,
     /// Time left before the next sso login.
     SSOExpiration,
     /// Exit code 0 if sso login is required.
@@ -365,6 +368,19 @@ mod tests {
         // role credentials and the client registration share one cache file, so
         // there is no per-profile logout to offer.
         assert!(Cli::try_parse_from(["ssologinlite", "logout", "--profile", "prod"]).is_err());
+    }
+
+    #[test]
+    fn test_imds_subcommand() {
+        let cli = Cli::try_parse_from(["ssologinlite", "imds"]).unwrap();
+        assert!(matches!(cli.command, Commands::Imds));
+    }
+
+    #[test]
+    fn test_imds_takes_no_arguments() {
+        // There's exactly one instance role per host, so — like Logout —
+        // there is no profile to select.
+        assert!(Cli::try_parse_from(["ssologinlite", "imds", "--profile", "prod"]).is_err());
     }
 
     #[test]

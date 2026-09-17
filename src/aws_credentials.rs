@@ -30,6 +30,11 @@ pub struct AWScredentials {
 // mid-call.
 const EXPIRY_SKEW_SECS: i64 = 60;
 
+// Fixed cache key for IMDSv2 instance-role credentials: unlike SSO/assume-role
+// profiles, there is exactly one instance role per host, so there is no
+// per-profile name to key on.
+pub(crate) const IMDS_CACHE_KEY: &str = "imds-instance-role";
+
 impl AWScredentials {
     fn is_expired(&self) -> bool {
         info!("Checking if credentials are expired");
@@ -106,6 +111,36 @@ impl AWScredentials {
             Self::get_assume_role_from_aws(assume_profile, sso_profile)
         })
         .await
+    }
+
+    // EC2 instance-role credentials via IMDSv2 — no SSO/browser step involved.
+    // There's exactly one instance role per host, so this is cached under the
+    // fixed IMDS_CACHE_KEY rather than a profile name.
+    pub async fn get_instance_credentials() -> Result<Self> {
+        info!("Getting EC2 instance-role credentials from IMDSv2");
+        Self::get_or_refresh(IMDS_CACHE_KEY, || {
+            crate::imds_credentials::get_instance_role_credentials_from_aws()
+        })
+        .await
+    }
+
+    // Build credentials from raw parts. Used by imds_credentials.rs, which
+    // lives outside this module and so can't construct Self directly (Version
+    // is private — it's an internal cache-format marker, not something other
+    // credential sources should ever choose a value for).
+    pub(crate) fn from_parts(
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: String,
+        expiration: String,
+    ) -> Self {
+        Self {
+            Version: 1_u8,
+            AccessKeyId: access_key_id,
+            SecretAccessKey: secret_access_key,
+            SessionToken: session_token,
+            Expiration: expiration,
+        }
     }
 
     async fn get_role_credentials_from_aws(profile: SsoProfile) -> Result<Self> {
@@ -337,6 +372,8 @@ impl std::fmt::Display for MyErrors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::imds_credentials::test_support::{EnvGuard, FakeImdsServer, ImdsScript};
+    use serial_test::serial;
 
     fn make_creds() -> AWScredentials {
         AWScredentials {
@@ -346,6 +383,57 @@ mod tests {
             SessionToken: "FwoGZXIvYXdzEA...".to_string(),
             Expiration: "2099-01-01T00:00:00+00:00".to_string(),
         }
+    }
+
+    // home_dir() (used by the cache path) reads HOME live, so this isolates
+    // the real cache file the same way file_helper.rs's tests do, restoring
+    // the previous value on drop (including on panic/unwind).
+    struct HomeGuard {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn new(path: &std::path::Path) -> Self {
+            let saved = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            HomeGuard { saved }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    // --- get_instance_credentials() caching integration ---
+
+    #[tokio::test]
+    #[serial(env_vars)]
+    async fn test_get_instance_credentials_caches_across_calls() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::new(tmp.path());
+
+        let server = FakeImdsServer::start(ImdsScript::default()).await;
+        let _env = EnvGuard::set(&[("AWS_EC2_METADATA_SERVICE_ENDPOINT", &server.endpoint())]);
+
+        let first = AWScredentials::get_instance_credentials().await.unwrap();
+        let connections_after_first = server.connections();
+        assert!(
+            connections_after_first > 0,
+            "first call must hit the (fake) IMDS server"
+        );
+
+        let second = AWScredentials::get_instance_credentials().await.unwrap();
+        assert_eq!(second.AccessKeyId, first.AccessKeyId);
+        assert_eq!(
+            server.connections(),
+            connections_after_first,
+            "second call within validity must be served from cache, not hit IMDS again"
+        );
     }
 
     // --- as_json() ---
@@ -417,6 +505,35 @@ mod tests {
         let json = r#"{"Version": 1, "AccessKeyId": "AK"}"#;
         let result = serde_json::from_str::<AWScredentials>(json);
         assert!(result.is_err());
+    }
+
+    // --- from_parts() / IMDS cache key ---
+
+    #[test]
+    fn test_from_parts_builds_expected_credentials() {
+        let creds = AWScredentials::from_parts(
+            "AKIAIOSFODNN7EXAMPLE".to_string(),
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            "FwoGZXIvYXdzEA...".to_string(),
+            "2099-01-01T00:00:00+00:00".to_string(),
+        );
+        assert_eq!(creds.Version, 1);
+        assert_eq!(creds.AccessKeyId, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(
+            creds.SecretAccessKey,
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        );
+        assert_eq!(creds.SessionToken, "FwoGZXIvYXdzEA...");
+        assert_eq!(creds.Expiration, "2099-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_imds_cache_key_is_stable() {
+        // Regression guard: this key is embedded in every user's on-disk
+        // cache file, so changing it silently would orphan existing cached
+        // IMDS credentials (harmless — just an extra fetch — but worth
+        // catching as an intentional change, not an accident).
+        assert_eq!(IMDS_CACHE_KEY, "imds-instance-role");
     }
 
     // --- Clone ---
