@@ -1,6 +1,5 @@
 // Import necessary dependencies
 use anyhow::{anyhow, Result};
-// use aws_config::imds::credentials;
 use clap::Parser;
 use log::{debug, error};
 use ssologinlite::aws_credentials::AWScredentials;
@@ -119,6 +118,10 @@ async fn main() -> Result<ExitCode> {
                     println!("Removed {}", path.display());
                 }
             }
+        }
+        Commands::Imds => {
+            let creds = AWScredentials::get_instance_credentials().await?;
+            println!("{}", creds.as_json()?);
         }
         Commands::SSOExpiration => {
             let conf = ProgramConfig::new()?;

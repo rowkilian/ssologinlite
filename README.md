@@ -28,6 +28,7 @@ default_sso_url = "https://myawsorg.awsapps.com/start/"
 - **AWS SSO Profile Management**: Automatically configure and manage SSO profiles
 - **Assume Role Support**: Seamlessly handle role assumption across accounts
 - **EKS Authentication**: Generate kubectl-compatible authentication tokens
+- **IMDSv2 Instance-Role Credentials**: Use an EC2 instance's own IAM role — no SSO or browser step needed
 - **Credential Caching**: Reduce authentication overhead with intelligent caching, cleared on demand with `logout`
 - **Shell Integration**: Starship prompt integration for credential expiration warnings
 
@@ -128,6 +129,28 @@ ssologinlite logout
 
 The next command triggers a fresh browser SSO login. This is safe to run when nothing
 is cached, and it leaves `profiles.json` and the log files alone.
+
+### IMDSv2 Instance-Role Credentials
+
+On an EC2 instance with an attached IAM instance profile, `ssologinlite imds` fetches
+that instance's own role credentials via IMDSv2 and prints them as JSON — no SSO
+profile, browser step, or `setup` is needed. This is for hosts that only have an
+instance role, as an alternative to the SSO-based `token` command:
+
+```bash
+ssologinlite imds
+```
+
+Use it as a `credential_process` in `~/.aws/config` the same way as `token`:
+
+```ini
+[profile ec2-instance-role]
+credential_process = ssologinlite imds
+```
+
+Credentials are cached the same way as every other credential source here (see
+Credential Caching above), and are cleared by `ssologinlite logout` along with
+everything else.
 
 ### Debug Mode
 
